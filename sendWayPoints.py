@@ -1,7 +1,7 @@
 from pymavlink import mavutil, mavwp
 
 #Start the connection to the SITL drone
-connection = mavutil.mavlink_connection('tcp:127.0.0.1:5760')
+connection = mavutil.mavlink_connection('udp:127.0.0.1:14550')
 connection.wait_heartbeat()
 print("Heartbeat from system (system %u component %u)" % (connection.target_system, connection.target_component))
 
