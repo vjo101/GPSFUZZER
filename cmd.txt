@@ -1,0 +1,6 @@
+SendWayPoints:
+../Tools/autotest/sim_vehicle.py --map --console --out=127.0.0.1:14550
+
+gpsSpoofingProto:
+python3 ../Tools/autotest/sim_vehicle.py --console --map -w (this clears out the previous run's parameters set)
+../Tools/autotest/sim_vehicle.py --map --console (The actual run)

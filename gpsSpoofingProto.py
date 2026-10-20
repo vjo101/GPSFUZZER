@@ -2,16 +2,16 @@ from pymavlink import mavutil, mavwp
 import time
 import threading
 
-'''Connection setup'''
-#Start the connection to the SITL drone
-connection = mavutil.mavlink_connection('udpin:127.0.0.1:14550')
-connection.wait_heartbeat()
-print("Heartbeat from system (system %u component %u)" % (connection.target_system, connection.target_component))
+'''gps_connection setup for the gps'''
+#Start the gps_connection to the SITL drone
+gps_connection = mavutil.mavlink_connection('tcp:127.0.0.1:5762')
+gps_connection.wait_heartbeat()
+print("Heartbeat from system (system %u component %u)" % (gps_connection.target_system, gps_connection.target_component))
 
 #This will request for the data stream
-connection.mav.request_data_stream_send(
-    connection.target_system,
-    connection.target_component,
+gps_connection.mav.request_data_stream_send(
+    gps_connection.target_system,
+    gps_connection.target_component,
     mavutil.mavlink.MAV_DATA_STREAM_ALL,
     4,
     1
@@ -24,9 +24,9 @@ param_value = 14.0  # Float value for MAVLink GPS type
 param_type = mavutil.mavlink.MAV_PARAM_TYPE_REAL32  # ArduPilot uses REAL32 for float parameters
 
 # Send the parameter set message, this also requires a reboot so we need to wait
-connection.mav.param_set_send(
-    connection.target_system,
-    connection.target_component,
+gps_connection.mav.param_set_send(
+    gps_connection.target_system,
+    gps_connection.target_component,
     param_id,
     param_value,
     param_type,
@@ -34,20 +34,34 @@ connection.mav.param_set_send(
 
 #Performing a reboot to allow it to use the GPS given from this script
 time.sleep(1)
-connection.reboot_autopilot()
+gps_connection.reboot_autopilot()
 
 #Checks to make sure the system is back up
 time.sleep(5)
-connection.wait_heartbeat()
+
+#Rebooting old connection
+gps_connection = mavutil.mavlink_connection('tcp:127.0.0.1:5762')
+gps_connection.wait_heartbeat()
+print("Heartbeat from system (system %u component %u)" % (gps_connection.target_system, gps_connection.target_component))
+
+#This will request for the data stream
+gps_connection.mav.request_data_stream_send(
+    gps_connection.target_system,
+    gps_connection.target_component,
+    mavutil.mavlink.MAV_DATA_STREAM_ALL,
+    4,
+    1
+)
+print("Reboot completed")
 
 # Request parameter value and check it is using 14
-connection.mav.param_request_read_send(
-    connection.target_system, connection.target_component, param_id, -1
+gps_connection.mav.param_request_read_send(
+    gps_connection.target_system, gps_connection.target_component, param_id, -1
 )
 
 # Wait for the param_value message response
 while True:
-    msg = connection.recv_match(type='PARAM_VALUE', blocking=True, timeout=3.0)
+    msg = gps_connection.recv_match(type='PARAM_VALUE', blocking=True, timeout=3.0)
     if not msg:
         print('No response received for GPS1_TYPE')
         break
@@ -56,29 +70,45 @@ while True:
         break
 
 '''This part is the waypoints part of the code'''
+
+'''gps_connection setup for waypoints, arming, etc'''
+#Start the gps_connection to the SITL drone
+event_connection = mavutil.mavlink_connection('tcp:127.0.0.1:5763')
+event_connection.wait_heartbeat()
+print("Heartbeat from system (system %u component %u)" % (event_connection.target_system, event_connection.target_component))
+
+#This will request for the data stream
+event_connection.mav.request_data_stream_send(
+    event_connection.target_system,
+    event_connection.target_component,
+    mavutil.mavlink.MAV_DATA_STREAM_ALL,
+    4,
+    1
+)
+
 # Loads the waypoints from the waypoint text file
 waypoint_loader = mavwp.MAVWPLoader()
 waypoint_loader.load('waypoints.txt')
 print(f"Loaded {waypoint_loader.count()} waypoints")
 
-connection.mav.mission_count_send(
-    connection.target_system,
-    connection.target_component,
+event_connection.mav.mission_count_send(
+    event_connection.target_system,
+    event_connection.target_component,
     waypoint_loader.count()
 )
 
 # We now need to handle the request from the drone for MISSION_REQUEST_INT so it get each point uploaded
 for i in range(0, waypoint_loader.count()):
-    mission_msg_rcv = connection.recv_match(type='MISSION_REQUEST', blocking=True)
+    mission_msg_rcv = event_connection.recv_match(type='MISSION_REQUEST', blocking=True)
     if not mission_msg_rcv:
         print("No mission request int from drone recieved")
         break;
     waypoint = waypoint_loader.wp(mission_msg_rcv.seq) # This will load a single waypoint from waypoints.txt file
-    connection.mav.send(waypoint) # INVESTIGATE FURTHER IF THIS IS ALLOWED
+    event_connection.mav.send(waypoint) # INVESTIGATE FURTHER IF THIS IS ALLOWED
     print(f"Sent mission item: {mission_msg_rcv.seq}")
 
 #This part ensures that the mission waypoints were properly uploaded
-if connection.recv_match(type='MISSION_ACK', blocking=True):
+if event_connection.recv_match(type='MISSION_ACK', blocking=True):
     print("Waypoint upload to drone is complete")
 else:
     print("Mission upload was unsuccessful")
@@ -95,7 +125,7 @@ def send_gps(lat, lon, alt, vn=0, ve=0, vd=0, fix=3, sats=12, hdop=0.8):
     gps_epoch = 315964800
     t = time.time() - gps_epoch + 18
     week, ms = int(t // 604800), int((t % 604800) * 1000)
-    connection.mav.gps_input_send(
+    gps_connection.mav.gps_input_send(
         int(time.time() * 1e6),   # time_usec
         0,                        # gps_id
         0,                        # ignore_flags (0 = use all fields)
@@ -111,10 +141,10 @@ def send_gps(lat, lon, alt, vn=0, ve=0, vd=0, fix=3, sats=12, hdop=0.8):
 def gps_feeder():
     while True:
         offset = 0
-        msg = connection.recv_match(type='SIMSTATE', blocking=False)
+        msg = gps_connection.recv_match(type='SIMSTATE', blocking=False)
         if msg:
             truth['lat'], truth['lon'] = msg.lat / 1e7, msg.lng / 1e7
-        
+
         if spoofNow == True:
             offset = 0.0001
         send_gps(truth['lat'], truth['lon'] + offset, truth['alt'])
@@ -128,7 +158,7 @@ gps_thread.start()
 
 #Need to wait till the GPS and EFK gets turned on
 print("Waiting for GPS fix")
-connection.wait_gps_fix()
+event_connection.wait_gps_fix()
 print("Got GPS fix")
 time.sleep(5)
 
@@ -136,25 +166,24 @@ time.sleep(5)
 efkImu0 = False
 efkImu1 = False
 while not (efkImu0 and efkImu1):
-    msg = connection.recv_match(type='STATUSTEXT', blocking=True)
-    if not msg:
-        print("EKFs are not using the GPS yet ...")
-    elif "EKF3 IMU0 is using GPS" in msg:
+    msg = event_connection.recv_match(type='STATUSTEXT', blocking=True)
+    print("Status: ", msg.text)
+    if "EKF3 IMU0 is using GPS" in msg.text:
         print("EKF3 IMU0 is Ready")
         efkImu0 = True
-    elif "EKF3 IMU1 is using GPS" in msg:
+    if "EKF3 IMU1 is using GPS" in msg.text:
         print("EKF3 IMU1 is Ready")
         efkImu1 = True
 print("Both EKFs are ready")
 
 #This will arm and wait till all are armed and make the drone take off
 print("waiting for arming")
-connection.arducopter_arm()
-connection.motors_armed_wait()
+event_connection.arducopter_arm()
+event_connection.motors_armed_wait()
 print("Armed")
 
 # This sets the robot mode to auto to be in auto mode
-connection.set_mode_auto()
+event_connection.set_mode_auto()
 print("Set the mission mode to auto\n")
 
 # Here you can set spoofing to be on or off
@@ -162,9 +191,9 @@ spoofNow = True
 
 #This will be run just to see progress
 while True:
-    waypoint_reached = connection.recv_match(type=['MISSION_ITEM_REACHED', 'STATUSTEXT', 'SIMSTATE'], blocking=True)
+    waypoint_reached = event_connection.recv_match(type=['MISSION_ITEM_REACHED', 'STATUSTEXT', 'SIMSTATE'], blocking=True)
     offset = 0
-    
+
     if not waypoint_reached:
         continue
     elif waypoint_reached.get_type() == 'MISSION_ITEM_REACHED':
