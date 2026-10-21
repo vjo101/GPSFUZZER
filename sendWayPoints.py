@@ -6,15 +6,6 @@ connection = mavutil.mavlink_connection('udpin:127.0.0.1:14550')
 connection.wait_heartbeat()
 print("Heartbeat from system (system %u component %u)" % (connection.target_system, connection.target_component))
 
-#This will request for the data stream
-connection.mav.request_data_stream_send(
-    connection.target_system,
-    connection.target_component,
-    mavutil.mavlink.MAV_DATA_STREAM_ALL,
-    4,
-    1
-)
-
 # Loads the waypoints from the waypoint text file
 waypoint_loader = mavwp.MAVWPLoader()
 waypoint_loader.load('waypoints.txt')
@@ -41,8 +32,6 @@ if connection.recv_match(type='MISSION_ACK', blocking=True):
     print("Waypoint upload to drone is complete")
 else:
     print("Mission upload was unsuccessful")
-
-#MUST WAIT TILL THE CONSOLE SAYS EKF IS USING GPS, I will fix this later using ESTIMATOR_STATUS messages
 
 #Need to wait till the GPS and EFK gets turned on
 print("Waiting for GPS fix")
