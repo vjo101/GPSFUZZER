@@ -1,0 +1,10 @@
+{
+  "seed": 20261125,
+  "duration_s": 12,
+  "drift": {
+    "start_delay_s": [0, 0],
+    "horizontal_speed_mps": [1, 1],
+    "bearing_deg": [90, 90],
+    "mode": "position_only"
+  }
+}
