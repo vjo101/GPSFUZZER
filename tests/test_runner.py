@@ -1,5 +1,8 @@
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -67,6 +70,30 @@ class FakeConnection:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_stopper_terminates_entire_sitl_process_group(self):
+        child_script = (
+            "import subprocess,sys,time; "
+            "subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+            "time.sleep(60)"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        ExperimentRunner._stop_process(process)
+        self.assertIsNotNone(process.poll())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("SITL process group still exists after cleanup")
+
     def test_validates_and_records_custom_simulation_location(self):
         ExperimentRunner._validate_location("60.0,24.0,100,0")
         with self.assertRaisesRegex(ValueError, "LAT,LON,ALT,HEADING"):
@@ -74,14 +101,37 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "out of range"):
             ExperimentRunner._validate_location("91,24,100,0")
 
-    def _runner(self, root, block, timeout=5.0, mavlink_factory=FakeConnection):
+    def test_gui_mavproxy_command_keeps_process_alive_without_stdin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ExperimentRunner(Path(tmp) / "ap", Path(tmp) / "results")
+            command = runner._sitl_command(
+                Path(tmp) / "run",
+                "quad",
+                None,
+                show_map=True,
+                show_console=True,
+            )
+            args = command[command.index("--mavproxy-args") + 1]
+            self.assertIn("--non-interactive", args)
+            self.assertIn("--cmd", args)
+            self.assertIn("--map", command)
+            self.assertIn("--console", command)
+
+    def _runner(
+        self,
+        root,
+        block,
+        timeout=5.0,
+        mavlink_factory=FakeConnection,
+        process_stopper=None,
+    ):
         return ExperimentRunner(
             root / "ardupilot",
             root / "results",
             process_factory=lambda *args, **kwargs: FakeProcess(),
             mavlink_factory=mavlink_factory,
             block_factory=lambda: block,
-            process_stopper=lambda process: None,
+            process_stopper=process_stopper or (lambda process: None),
             ready_timeout_s=timeout,
             poll_interval_s=0.001,
             heartbeat_interval_s=0.01,
@@ -293,6 +343,50 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(record["termination_reason"], "hook_status_stale")
             self.assertIn("source_revisions", record)
             self.assertIn("telemetry", record["log_paths"])
+
+    def test_user_interruption_records_and_cleans_gui_enabled_sitl(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            block = FakeBlock()
+            stopped = []
+            runner = self._runner(
+                root,
+                block,
+                process_stopper=lambda process: stopped.append(process),
+            )
+            with patch("gpsfuzzer.runner.time.sleep", side_effect=KeyboardInterrupt):
+                result = runner.run(
+                    ExperimentConfig(seed=12, duration_s=2),
+                    show_map=True,
+                    show_console=True,
+                )
+            record = json.loads(result.record_path.read_text())
+            self.assertEqual(result.termination_reason, "user_interrupted")
+            self.assertTrue(result.cleanup_complete)
+            self.assertEqual(len(stopped), 1)
+            self.assertTrue(record["sitl"]["map_enabled"])
+            self.assertTrue(record["sitl"]["console_enabled"])
+            self.assertTrue(record["cleanup"]["complete"])
+            self.assertTrue(Path(record["log_paths"]["telemetry"]).exists())
+
+    def test_startup_error_still_runs_process_cleanup_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            block = FakeBlock()
+            stopped = []
+            result = self._runner(
+                root,
+                block,
+                mavlink_factory=lambda: (_ for _ in ()).throw(RuntimeError("startup error")),
+                process_stopper=lambda process: stopped.append(process),
+            ).run(ExperimentConfig(seed=12, duration_s=1))
+            record = json.loads(result.record_path.read_text())
+            self.assertEqual(result.status, "failed")
+            self.assertTrue(result.cleanup_complete)
+            self.assertEqual(stopped, [None])
+            self.assertEqual(record["cleanup"]["errors"], [])
 
 
 if __name__ == "__main__":

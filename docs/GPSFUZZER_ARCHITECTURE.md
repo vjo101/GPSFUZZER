@@ -2,10 +2,10 @@
 
 ## Responsibilities
 
-The Python package validates experiment inputs, samples delay/speed/bearing
-from the configured seed, publishes a GPS-specific shared-memory command,
-checks hook status, and is responsible for experiment lifecycle and provenance
-collection. `gpsfuzzer/config.py` defines typed ranges and the velocity mode;
+The Python package validates experiment inputs, runs fixed-size campaigns, and
+derives a reproducible per-run seed for sampling delay/speed/bearing. Each
+campaign runs independent SITL experiments sequentially and records campaign
+and iteration provenance. `gpsfuzzer/config.py` defines typed ranges and the velocity mode;
 `gpsfuzzer/drift.py` returns an immutable `EffectiveDrift` record. The
 `gpsfuzzer/ipc.py` module owns serialization and System V segment lifecycle.
 `gpsfuzzer/runner.py` starts ArduCopter SITL, monitors the hook, captures raw
@@ -147,11 +147,12 @@ or invalid; a missing shared-memory segment leaves the GPS measurement
 unchanged.
 
 The runner explicitly publishes a disabled command for baseline runs and
-on normal shutdown. On communication loss, SITL's command TTL disables
-mutation. Cleanup order is: publish disable if communication remains, stop
-SITL, detach Python, then remove the System V segment. Removing the segment
-while SITL is attached is safe at the kernel level but it remains mapped until
-the SITL process exits.
+shutdown. On communication loss, SITL's command TTL disables mutation. Each
+SITL launch runs in an isolated process group. Cleanup sends a graceful stop to
+the whole group, waits for SITL and any MAVProxy map/console process to exit,
+then force-kills remaining group members if needed. The runner reaps the SITL
+process before detaching Python and removing the System V segment. The next
+campaign iteration does not start if process cleanup failed.
 
 ## Experiment provenance
 
@@ -183,14 +184,34 @@ and `../GPSFUZZER/.venv/bin/python ./waf copter`. Then run:
 
 Use `--baseline` to run the same SITL workflow with mutation disabled and
 `--mission path/to/mission.txt` to upload and execute a QGroundControl WPL
-mission. Add `--map` to start ArduPilot's MAVProxy map with GPS, simulator
+mission. Add `--iterations N` to run N independent experiments in one
+campaign; each receives a deterministic seed derived from the configured
+campaign seed and its iteration index. The default is one iteration. Each
+campaign creates `results/<campaign-id>/campaign.json` and stores experiment
+directories under `results/<campaign-id>/runs/`. The summary is updated after
+each attempt and contains run paths, outcomes, and effective attack settings.
+Mission failures and incomplete outcomes are recorded and do not prevent later
+iterations. A user interrupt leaves a partial campaign summary.
+
+Use `--until-stopped` instead of `--iterations N` to keep starting independent
+experiments until you press Ctrl-C. The active experiment is recorded as
+incomplete, its SITL/MAVProxy process group is cleaned up, and the campaign
+summary is finalized with status `interrupted`, `requested_iterations: null`,
+and the actual attempt count. For example:
+
+```sh
+./.venv/bin/python -m gpsfuzzer configs/sitl-example.json \
+  --ardupilot ../ardupilot --results results --until-stopped
+```
+
+Add `--map` to start ArduPilot's MAVProxy map with GPS, simulator
 truth, and AHRS/EKF position overlays enabled. Add `--console` to launch the
-MAVProxy console as well. With either GUI option, the runner leaves MAVProxy
-connected to SITL and receives a telemetry copy on UDP port 14550; headless
-runs continue to connect directly on port 5760. The selected UI options and
-telemetry port are recorded in `experiment.json`. Each run writes
-`experiment.json`, `telemetry.jsonl`, the SITL console log, and DataFlash BIN
-paths under a unique results directory.
+MAVProxy console as well. With either GUI option, the runner receives a
+telemetry copy on UDP port 14550; headless runs connect directly on port 5760.
+The selected UI options and telemetry port are recorded in `experiment.json`.
+The runner stops and reaps MAVProxy along with SITL after the experiment result
+is recorded. Each run writes `experiment.json`, `telemetry.jsonl`, the SITL
+console log, and any DataFlash BIN files under its unique run directory.
 
 For a live mission map, run:
 

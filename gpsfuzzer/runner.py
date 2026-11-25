@@ -38,6 +38,7 @@ class RunResult:
     duration_s: float
     effective_drift: EffectiveDrift | None
     record_path: Path
+    cleanup_complete: bool = True
 
 
 class ExperimentRunner:
@@ -142,16 +143,19 @@ class ExperimentRunner:
             # Keep MAVProxy's SITL input on UDP 5760 and send a second copy to
             # GPSFuzzer. --no-extra-ports suppresses default GCS ports, so add
             # this explicit output for the runner's independent telemetry link.
+            # The runner has no interactive stdin; keeping MAVProxy's shell in
+            # its default mode would make it exit on EOF and stop SITL.
             command.extend(["--out", "127.0.0.1:14550"])
+            mavproxy_args = ["--non-interactive"]
             if show_map:
-                command.extend([
-                    "--map",
-                    "--mavproxy-args",
+                mavproxy_args.append(
                     '--cmd "map set showgpspos 1; map set showsimpos 1; '
-                    'map set showahrspos 1"',
-                ])
+                    'map set showahrspos 1"'
+                )
+                command.append("--map")
             if show_console:
                 command.append("--console")
+            command.extend(["--mavproxy-args", " ".join(mavproxy_args)])
         if location is not None:
             command.extend(["--custom-location", location])
         return command
@@ -171,19 +175,49 @@ class ExperimentRunner:
 
     @staticmethod
     def _stop_process(process) -> None:
-        if process is None or process.poll() is not None:
+        if process is None:
             return
+        process_group = process.pid
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            if process.poll() is None:
+                process.terminate()
         except (OSError, AttributeError):
-            process.terminate()
+            if process.poll() is None:
+                process.terminate()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                break
+            except (OSError, AttributeError):
+                if process.poll() is not None:
+                    break
+            if process.poll() is not None:
+                try:
+                    process.wait(timeout=0)
+                except (subprocess.TimeoutExpired, ChildProcessError):
+                    pass
+            time.sleep(0.05)
+
+        try:
+            os.killpg(process_group, 0)
+        except (ProcessLookupError, OSError, AttributeError):
+            pass
+        else:
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except (OSError, AttributeError):
+                if process.poll() is None:
+                    process.kill()
+
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, AttributeError):
-                process.kill()
+            process.kill()
             process.wait(timeout=5)
 
     @staticmethod
@@ -242,6 +276,7 @@ class ExperimentRunner:
         heartbeat_stop_after_s: float | None = None,
         show_map: bool = False,
         show_console: bool = False,
+        campaign: dict | None = None,
     ) -> RunResult:
         """Run SITL, fail on unavailable/stale hook, and retain partial outputs."""
         self._validate_location(location)
@@ -286,6 +321,8 @@ class ExperimentRunner:
         telemetry_count = 0
         telemetry_requested = False
         hook_events: list[dict] = []
+        cleanup_errors: list[str] = []
+        cleanup_complete = True
         last_publish = 0.0
         mavproxy_enabled = show_map or show_console
         mavlink_port = 14550 if mavproxy_enabled else 5760
@@ -539,6 +576,15 @@ class ExperimentRunner:
                         }
             finally:
                 console.close()
+        except KeyboardInterrupt:
+            termination_reason = "user_interrupted"
+            run_status = "incomplete"
+            if mission_run and mission_outcome is None:
+                mission_outcome = {
+                    "category": "incomplete",
+                    "reason": "user_interrupted",
+                    **(outcome_monitor.evidence() if outcome_monitor is not None else {}),
+                }
         except Exception as exc:
             termination_reason = f"runner_error:{type(exc).__name__}:{exc}"
             run_status = "failed" if ready_at is None else "incomplete"
@@ -570,14 +616,23 @@ class ExperimentRunner:
                         time.sleep(self.poll_interval_s)
                 except Exception:
                     pass
-            self.process_stopper(process)
+            try:
+                self.process_stopper(process)
+            except Exception as exc:
+                cleanup_complete = False
+                cleanup_errors.append(f"process_group_cleanup:{type(exc).__name__}:{exc}")
             if connection is not None:
                 try:
                     connection.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    cleanup_complete = False
+                    cleanup_errors.append(f"mavlink_close:{type(exc).__name__}:{exc}")
             if block is not None:
-                block.close(remove=True)
+                try:
+                    block.close(remove=True)
+                except Exception as exc:
+                    cleanup_complete = False
+                    cleanup_errors.append(f"shared_memory_cleanup:{type(exc).__name__}:{exc}")
 
         ended_at = time.monotonic()
         if mission_run and mission_outcome is None:
@@ -587,10 +642,18 @@ class ExperimentRunner:
                 **(outcome_monitor.evidence() if outcome_monitor is not None else {}),
             }
         sitl_log_files = sorted(str(path) for path in sitl_dir.rglob("*.BIN"))
+        if cleanup_errors:
+            run_status = "failed"
+            termination_reason = f"{termination_reason};cleanup_failed"
         record = {
             "run_id": run_id,
+            "campaign": campaign,
             "status": run_status,
             "termination_reason": termination_reason,
+            "cleanup": {
+                "complete": cleanup_complete,
+                "errors": cleanup_errors,
+            },
             "seed": config.seed,
             "configuration": effective_config,
             "effective_drift": None if effective is None else {
@@ -640,5 +703,5 @@ class ExperimentRunner:
         record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         return RunResult(
             run_id, run_status, termination_reason,
-            round(ended_at - started_at, 3), effective, record_path,
+            round(ended_at - started_at, 3), effective, record_path, cleanup_complete,
         )

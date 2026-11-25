@@ -1,11 +1,12 @@
-# AI can ignore this. This is just for us humans to keep track of stuff
+# Project follow-up
 
-- make sure missions can be uploaded: I (i think this works: it works)
-
-- right now it doesn't iterate and change the values (i think)
-
-- does not randomly mutates the possibilities again yet after a run
-
-- add resilience
+- fixed-count campaign execution, per-run GPS attack sampling, and isolated run records are implemented in `gps-sitl-fuzzing-campaign-iterations`
 
 - add mission mutation
+
+- see if we can actually trigger an EKF failsafe
+
+- might need to add stuff that doesn't immediately end run once it drifts far away enough
+
+- add feedback-guided resilience analysis
+

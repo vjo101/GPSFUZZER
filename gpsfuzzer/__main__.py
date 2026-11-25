@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .config import DriftConfig, DriftMode, ExperimentConfig, NumericRange
-from .runner import ExperimentRunner
+from .campaign import CampaignRunner
 
 
 def _configuration(path: Path) -> ExperimentConfig:
@@ -28,6 +28,18 @@ def main() -> int:
     parser.add_argument("config", type=Path, help="JSON experiment configuration")
     parser.add_argument("--ardupilot", type=Path, required=True, help="ArduPilot checkout")
     parser.add_argument("--results", type=Path, default=Path("results"))
+    campaign_mode = parser.add_mutually_exclusive_group()
+    campaign_mode.add_argument(
+        "--iterations",
+        type=int,
+        default=1,
+        help="number of independent SITL experiments to run in this campaign",
+    )
+    campaign_mode.add_argument(
+        "--until-stopped",
+        action="store_true",
+        help="keep running independent experiments until interrupted with Ctrl-C",
+    )
     parser.add_argument("--baseline", action="store_true", help="run with GPS mutation disabled")
     parser.add_argument("--frame", default="quad")
     parser.add_argument("--mission", type=Path, help="optional QGroundControl WPL mission to execute")
@@ -49,8 +61,9 @@ def main() -> int:
     )
     args = parser.parse_args()
     config = _configuration(args.config)
-    result = ExperimentRunner(args.ardupilot, args.results).run(
+    result = CampaignRunner(args.ardupilot, args.results).run(
         config,
+        iterations=None if args.until_stopped else args.iterations,
         baseline=args.baseline,
         frame=args.frame,
         mission_file=args.mission,
@@ -59,8 +72,15 @@ def main() -> int:
         show_map=args.map,
         show_console=args.console,
     )
-    print(f"{result.status}: {result.termination_reason}; record={result.record_path}")
-    return 0 if result.status == "completed" else 1
+    attempts = (
+        f"{result.completed_attempts}/{result.requested_iterations} attempts"
+        if result.requested_iterations is not None
+        else f"{result.completed_attempts} attempts (until stopped)"
+    )
+    print(f"campaign {result.status}: {attempts}; record={result.record_path}")
+    if result.status == "completed" or (args.until_stopped and result.status == "interrupted"):
+        return 0
+    return 1
 
 
 if __name__ == "__main__":
