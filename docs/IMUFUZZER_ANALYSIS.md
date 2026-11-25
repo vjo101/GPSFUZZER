@@ -16,6 +16,23 @@ and later collects DataFlash and MAVLink logs. The larger program performs
 mission and parameter exploration and computes IMU-oriented resiliency scores;
 that scoring is not a GPS behavior requirement.
 
+### Mission upload timing
+
+`src/mavlinkCommander.py` waits for a heartbeat, then for the status text
+`EKF3 IMU0 is using GPS`, and pauses two seconds. Its `run()` order is GUIDED,
+arm, command a 10 m takeoff and wait for the height to be reached, upload the
+mission, then switch to AUTO. `uploadmission()` parses the QGC WPL file, clears
+the current mission, sends the item count, and answers waypoint requests with
+the corresponding mission items. The reference does not wait for a final
+mission ACK. `missionManager.py` generates the WPL mission before this run;
+mission mutation is separate from the MAVLink upload and execution sequence.
+
+GPSFuzzer follows that order for its supplied static WPL file. It uses an
+airborne report from `EXTENDED_SYS_STATE` or the 10 m `GLOBAL_POSITION_INT`
+altitude, then uses `MAVWPLoader` and waits for the final mission ACK before
+entering AUTO. The explicit ACK and bounded waits are reliability additions;
+the readiness, takeoff-before-upload, and AUTO ordering follow IMUFuzzer.
+
 `src/sensorFuzzingEngine.py` dispatches by target sensor and strategy. Its
 `shmInit()` creates/initializes the mutation interface. `startFuzzing()` picks
 a strategy from a comma-separated list and calls the matching accelerometer,

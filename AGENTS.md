@@ -20,7 +20,7 @@ using ArduPilot Software In The Loop (SITL).
 
 The parent workspace contains three repositories:
 
-### ../IMUFuzzer/
+### ../imufuzzer/
 
 Original IMU fuzzing implementation.
 

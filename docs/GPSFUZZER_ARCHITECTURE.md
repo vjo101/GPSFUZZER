@@ -14,6 +14,15 @@ mission file is supplied, `gpsfuzzer/mission.py` uploads it and starts AUTO
 mode for baseline and drift runs. A custom `LAT,LON,ALT,HEADING` option lets
 experiments validate geographic conversion at different latitudes.
 
+Mission runs wait for `EKF3 IMU0 is using GPS`, settle for two seconds, then
+follow IMUFuzzer's order: GUIDED, arm, take off, wait for `EXTENDED_SYS_STATE`
+to report `IN_AIR` or for `GLOBAL_POSITION_INT` to show a 10 m climb, upload
+the static mission, and enter AUTO. The heartbeat can arrive
+before mission storage initialization has completed, so uploading immediately
+after connection can be rejected with zero available mission slots. GPS drift
+stays inactive until the airborne report, then a new hook command starts the
+configured delay. A 120-second takeoff timeout records the run as incomplete.
+
 ArduPilot's SITL GPS path remains responsible for constructing its native
 `GPS_Data` sample. The hook in `libraries/SITL/SIM_GPS.cpp` reads the command
 and adjusts that sample before backend publication. The hook applies to the
@@ -132,10 +141,38 @@ and `../GPSFUZZER/.venv/bin/python ./waf copter`. Then run:
 
 Use `--baseline` to run the same SITL workflow with mutation disabled and
 `--mission path/to/mission.txt` to upload and execute a QGroundControl WPL
-mission. Each run writes `experiment.json`, `telemetry.jsonl`, the SITL
-console log, and DataFlash BIN paths under a unique results directory.
+mission. Add `--map` to start ArduPilot's MAVProxy map with GPS, simulator
+truth, and AHRS/EKF position overlays enabled. Add `--console` to launch the
+MAVProxy console as well. With either GUI option, the runner leaves MAVProxy
+connected to SITL and receives a telemetry copy on UDP port 14550; headless
+runs continue to connect directly on port 5760. The selected UI options and
+telemetry port are recorded in `experiment.json`. Each run writes
+`experiment.json`, `telemetry.jsonl`, the SITL console log, and DataFlash BIN
+paths under a unique results directory.
+
+For a live mission map, run:
+
+```sh
+./.venv/bin/python -m gpsfuzzer configs/sitl-coherent.json \
+  --ardupilot ../ardupilot --results results \
+  --mission waypoints.txt --map --console
+```
+
 Use `--location 60,24,100,0` to place the simulator at 60° latitude for
 longitude-scale checks. Use `--drop-heartbeat-after 5` to stop refreshing a
 command five seconds after hook readiness and exercise the two-second command
 TTL; that injected communication loss is expected to produce an incomplete
 record with captured logs.
+
+### Important changes to ardupilot
+./.venv/bin/pip install MAVProxy
+MAVPROXY_CMD="$PWD/.venv/bin/mavproxy.py" \
+  ./.venv/bin/python -m gpsfuzzer configs/sitl-coherent.json \
+  --ardupilot ../ardupilot --results results \
+  --mission waypoints.txt --map --console
+
+PYTHONPATH=/usr/lib/python3/dist-packages \
+MAVPROXY_CMD="$PWD/.venv/bin/mavproxy.py" \
+./.venv/bin/python -m gpsfuzzer configs/sitl-coherent.json \
+  --ardupilot ../ardupilot --results results \
+  --mission waypoints.txt --map --console

@@ -59,13 +59,13 @@ class ExperimentRunner:
         self.poll_interval_s = poll_interval_s
         self.heartbeat_interval_s = heartbeat_interval_s
 
-    def _open_mavlink(self):
+    def _open_mavlink(self, port: int = 5760):
         if self.mavlink_factory is not None:
             return self.mavlink_factory()
         from pymavlink import mavutil
 
         return mavutil.mavlink_connection(
-            "udpin:127.0.0.1:5760", autoreconnect=True
+            f"udpin:127.0.0.1:{port}", autoreconnect=True
         )
 
     @staticmethod
@@ -111,15 +111,40 @@ class ExperimentRunner:
         except (OSError, subprocess.SubprocessError):
             return None
 
-    def _sitl_command(self, run_dir: Path, frame: str, location: str | None) -> list[str]:
+    def _sitl_command(
+        self,
+        run_dir: Path,
+        frame: str,
+        location: str | None,
+        *,
+        show_map: bool = False,
+        show_console: bool = False,
+    ) -> list[str]:
+        mavproxy_enabled = show_map or show_console
         command = [
             sys.executable,
             str(self.ardupilot_dir / "Tools/autotest/sim_vehicle.py"),
             "-v", "ArduCopter", "-f", frame,
-            "--no-rebuild", "--no-mavproxy", "--udp", "--no-extra-ports",
+            "--no-rebuild", "--udp", "--no-extra-ports",
             "--use-dir", str(run_dir / "sitl"),
             "-S", "1",
         ]
+        if not mavproxy_enabled:
+            command.append("--no-mavproxy")
+        else:
+            # Keep MAVProxy's SITL input on UDP 5760 and send a second copy to
+            # GPSFuzzer. --no-extra-ports suppresses default GCS ports, so add
+            # this explicit output for the runner's independent telemetry link.
+            command.extend(["--out", "127.0.0.1:14550"])
+            if show_map:
+                command.extend([
+                    "--map",
+                    "--mavproxy-args",
+                    '--cmd "map set showgpspos 1; map set showsimpos 1; '
+                    'map set showahrspos 1"',
+                ])
+            if show_console:
+                command.append("--console")
         if location is not None:
             command.extend(["--custom-location", location])
         return command
@@ -206,6 +231,8 @@ class ExperimentRunner:
         mission_file: str | Path | None = None,
         location: str | None = None,
         heartbeat_stop_after_s: float | None = None,
+        show_map: bool = False,
+        show_console: bool = False,
     ) -> RunResult:
         """Run SITL, fail on unavailable/stale hook, and retain partial outputs."""
         self._validate_location(location)
@@ -225,6 +252,18 @@ class ExperimentRunner:
         effective = None if baseline else sample_drift(config.drift, config.seed)
         experiment_id = time.time_ns() & ((1 << 63) - 1)
         sequence = 1
+        mission_run = mission_file is not None
+        initial_drift = None if baseline or mission_run else effective
+        mission_gate = {
+            "takeoff_started_monotonic_ns": None,
+            "auto_confirmed_monotonic_ns": None,
+            "takeoff_detected_monotonic_ns": None,
+            "takeoff_wait_s": None,
+            "command_sequence": None,
+            "drift_command_sequence": None,
+            "hook_ack_simulation_time_us": None,
+        }
+        mission_count = None
         process = None
         connection = None
         block = None
@@ -236,7 +275,15 @@ class ExperimentRunner:
         telemetry_requested = False
         hook_events: list[dict] = []
         last_publish = 0.0
-        command = self._sitl_command(run_dir, frame, location)
+        mavproxy_enabled = show_map or show_console
+        mavlink_port = 14550 if mavproxy_enabled else 5760
+        command = self._sitl_command(
+            run_dir,
+            frame,
+            location,
+            show_map=show_map,
+            show_console=show_console,
+        )
         effective_config = {
             "seed": config.seed,
             "duration_s": config.duration_s,
@@ -248,7 +295,7 @@ class ExperimentRunner:
 
         try:
             block = self.block_factory()
-            connection = self._open_mavlink()
+            connection = self._open_mavlink(mavlink_port)
             console = console_path.open("w", encoding="utf-8")
             try:
                 process = self.process_factory(
@@ -265,7 +312,7 @@ class ExperimentRunner:
                     now = time.monotonic()
                     if now - last_publish >= self.heartbeat_interval_s:
                         block.write_command(encode_command(
-                            sequence, experiment_id, effective,
+                            sequence, experiment_id, initial_drift,
                             published_monotonic_ns=time.monotonic_ns(),
                         ))
                         last_publish = now
@@ -294,11 +341,10 @@ class ExperimentRunner:
                         termination_reason = "hook_unavailable_or_not_ready"
                     run_status = "failed"
                 else:
-                    mission_count = None
                     mission_failed = False
                     if mission_file is not None:
                         try:
-                            from .mission import upload_and_start_mission
+                            from .mission import MissionTakeoffTimeout, upload_and_start_mission
 
                             def record_mission_message(message):
                                 nonlocal telemetry_count, last_publish
@@ -307,16 +353,90 @@ class ExperimentRunner:
                                         telemetry_count += self._write_telemetry_message(telemetry, message)
                                 now = time.monotonic()
                                 if now - last_publish >= self.heartbeat_interval_s:
+                                    command_drift = (
+                                        effective
+                                        if mission_gate["takeoff_detected_monotonic_ns"] is not None
+                                        else None
+                                    )
                                     block.write_command(encode_command(
-                                        sequence, experiment_id, effective,
+                                        sequence, experiment_id, command_drift,
                                         published_monotonic_ns=time.monotonic_ns(),
                                     ))
                                     last_publish = now
 
+                            def record_auto_confirmation(monotonic_ns):
+                                mission_gate["auto_confirmed_monotonic_ns"] = monotonic_ns
+
+                            def record_takeoff_started(monotonic_ns):
+                                mission_gate["takeoff_started_monotonic_ns"] = monotonic_ns
+
+                            def activate_after_takeoff(monotonic_ns):
+                                nonlocal sequence, last_publish
+                                mission_gate["takeoff_detected_monotonic_ns"] = monotonic_ns
+                                mission_gate["takeoff_wait_s"] = round(
+                                    (monotonic_ns - mission_gate["takeoff_started_monotonic_ns"])
+                                    / 1_000_000_000,
+                                    6,
+                                )
+                                sequence += 1
+                                mission_gate["command_sequence"] = sequence
+                                command_drift = None if baseline else effective
+                                if command_drift is not None:
+                                    mission_gate["drift_command_sequence"] = sequence
+                                block.write_command(encode_command(
+                                    sequence,
+                                    experiment_id,
+                                    command_drift,
+                                    published_monotonic_ns=time.monotonic_ns(),
+                                ))
+                                last_publish = time.monotonic()
+
                             mission_count = upload_and_start_mission(
-                                connection, mission_file, on_message=record_mission_message
+                                connection,
+                                mission_file,
+                                takeoff_timeout_s=120.0,
+                                on_message=record_mission_message,
+                                on_auto_confirmed=record_auto_confirmation,
+                                on_takeoff_started=record_takeoff_started,
+                                on_takeoff=activate_after_takeoff,
                             )
+                            # The hook starts its simulation-time delay when it
+                            # consumes a fresh sequence, so wait for that ack
+                            # before starting the experiment duration clock.
+                            ack_deadline = time.monotonic() + self.ready_timeout_s
+                            while time.monotonic() < ack_deadline:
+                                if process.poll() is not None:
+                                    raise RuntimeError("SITL exited before acknowledging takeoff command")
+                                status = block.read_status()
+                                if (
+                                    status.state == STATE_READY
+                                    and status.acknowledged_sequence == mission_gate["command_sequence"]
+                                ):
+                                    mission_gate["hook_ack_simulation_time_us"] = status.simulation_time_us
+                                    hook_events.append({
+                                        "monotonic_ns": time.monotonic_ns(),
+                                        "state": status.state,
+                                        "acknowledged_sequence": status.acknowledged_sequence,
+                                        "error_code": status.error_code,
+                                        "simulation_time_us": status.simulation_time_us,
+                                    })
+                                    break
+                                if status.state in (STATE_STALE,):
+                                    raise RuntimeError("GPS mutation hook became stale at takeoff")
+                                time.sleep(self.poll_interval_s)
+                            else:
+                                raise TimeoutError("GPS mutation hook did not acknowledge takeoff command")
                             ready_at = time.monotonic()
+                        except MissionTakeoffTimeout as exc:
+                            if mission_gate["takeoff_started_monotonic_ns"] is not None:
+                                mission_gate["takeoff_wait_s"] = round(
+                                    (time.monotonic_ns() - mission_gate["takeoff_started_monotonic_ns"])
+                                    / 1_000_000_000,
+                                    6,
+                                )
+                            termination_reason = f"mission_takeoff_timeout:{exc}"
+                            run_status = "incomplete"
+                            mission_failed = True
                         except Exception as exc:
                             termination_reason = f"mission_start_failed:{type(exc).__name__}:{exc}"
                             mission_failed = True
@@ -427,10 +547,15 @@ class ExperimentRunner:
                 "cwd": str(self.ardupilot_dir),
                 "frame": frame,
                 "custom_location": location,
+                "mavproxy_enabled": mavproxy_enabled,
+                "map_enabled": show_map,
+                "console_enabled": show_console,
+                "telemetry_port": mavlink_port,
             },
             "mission": {
                 "path": None if mission_file is None else str(Path(mission_file).resolve()),
-                "items_uploaded": locals().get("mission_count"),
+                "items_uploaded": mission_count,
+                "takeoff_gate": None if not mission_run else mission_gate,
             },
             "communication_fault_injection": {
                 "heartbeat_stop_after_s": heartbeat_stop_after_s,

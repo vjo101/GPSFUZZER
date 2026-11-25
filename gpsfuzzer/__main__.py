@@ -33,6 +33,16 @@ def main() -> int:
     parser.add_argument("--mission", type=Path, help="optional QGroundControl WPL mission to execute")
     parser.add_argument("--location", help="optional LAT,LON,ALT,HEADING for SITL")
     parser.add_argument(
+        "--map",
+        action="store_true",
+        help="launch MAVProxy's live map with GPS, simulator truth, and AHRS/EKF overlays",
+    )
+    parser.add_argument(
+        "--console",
+        action="store_true",
+        help="launch MAVProxy's live console alongside SITL",
+    )
+    parser.add_argument(
         "--drop-heartbeat-after",
         type=float,
         help="stop refreshing the shared-memory command after N seconds; for fault testing",
@@ -46,6 +56,8 @@ def main() -> int:
         mission_file=args.mission,
         location=args.location,
         heartbeat_stop_after_s=args.drop_heartbeat_after,
+        show_map=args.map,
+        show_console=args.console,
     )
     print(f"{result.status}: {result.termination_reason}; record={result.record_path}")
     return 0 if result.status == "completed" else 1
