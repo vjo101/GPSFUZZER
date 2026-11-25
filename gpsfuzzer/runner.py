@@ -15,6 +15,13 @@ from typing import Callable
 
 from .config import ExperimentConfig
 from .drift import EffectiveDrift, sample_drift
+from .mission import MissionRoute
+from .outcome import (
+    DEFAULT_DEVIATION_LIMIT_M,
+    DEFAULT_PROGRESS_TIMEOUT_S,
+    LANDED_RELATIVE_ALTITUDE_M,
+    MissionOutcomeMonitor,
+)
 from .ipc import (
     STATE_READY,
     STATE_STALE,
@@ -192,7 +199,7 @@ class ExperimentRunner:
         return True
 
     @classmethod
-    def _drain_telemetry(cls, connection, stream) -> int:
+    def _drain_telemetry(cls, connection, stream, observer=None) -> int:
         count = 0
         if connection is None:
             return count
@@ -201,6 +208,8 @@ class ExperimentRunner:
             if message is None:
                 break
             count += cls._write_telemetry_message(stream, message)
+            if observer is not None:
+                observer.consume(message)
         stream.flush()
         return count
 
@@ -264,6 +273,9 @@ class ExperimentRunner:
             "hook_ack_simulation_time_us": None,
         }
         mission_count = None
+        mission_route = None
+        outcome_monitor = None
+        mission_outcome = None
         process = None
         connection = None
         block = None
@@ -294,6 +306,8 @@ class ExperimentRunner:
         }
 
         try:
+            if mission_file is not None:
+                mission_route = MissionRoute.from_file(mission_file)
             block = self.block_factory()
             connection = self._open_mavlink(mavlink_port)
             console = console_path.open("w", encoding="utf-8")
@@ -427,6 +441,10 @@ class ExperimentRunner:
                             else:
                                 raise TimeoutError("GPS mutation hook did not acknowledge takeoff command")
                             ready_at = time.monotonic()
+                            outcome_monitor = MissionOutcomeMonitor(
+                                mission_route,
+                                started_at=ready_at,
+                            )
                         except MissionTakeoffTimeout as exc:
                             if mission_gate["takeoff_started_monotonic_ns"] is not None:
                                 mission_gate["takeoff_wait_s"] = round(
@@ -436,9 +454,17 @@ class ExperimentRunner:
                                 )
                             termination_reason = f"mission_takeoff_timeout:{exc}"
                             run_status = "incomplete"
+                            mission_outcome = {
+                                "category": "incomplete",
+                                "reason": "mission_takeoff_timeout",
+                            }
                             mission_failed = True
                         except Exception as exc:
                             termination_reason = f"mission_start_failed:{type(exc).__name__}:{exc}"
+                            mission_outcome = {
+                                "category": "failed",
+                                "reason": "mission_start_failed",
+                            }
                             mission_failed = True
                     if not mission_failed:
                         termination_reason = "duration_elapsed"
@@ -483,15 +509,44 @@ class ExperimentRunner:
                             run_status = "incomplete"
                             break
                         with telemetry_path.open("a", encoding="utf-8") as telemetry:
-                            telemetry_count += self._drain_telemetry(connection, telemetry)
+                            telemetry_count += self._drain_telemetry(
+                                connection,
+                                telemetry,
+                                outcome_monitor if mission_run else None,
+                            )
+                        if outcome_monitor is not None:
+                            detected = outcome_monitor.evaluate(now=time.monotonic())
+                            if detected is not None:
+                                mission_outcome = {
+                                    "category": detected.category,
+                                    "reason": detected.reason,
+                                    **outcome_monitor.evidence(),
+                                }
+                                termination_reason = detected.reason
+                                run_status = "completed" if detected.category == "success" else "failed"
+                                break
                         if not telemetry_requested:
                             telemetry_requested = self._request_telemetry_streams(connection)
                         time.sleep(self.poll_interval_s)
+                    if mission_run and mission_outcome is None and not mission_failed:
+                        if run_status == "completed" and termination_reason == "duration_elapsed":
+                            run_status = "incomplete"
+                            termination_reason = "mission_duration_expired"
+                        mission_outcome = {
+                            "category": "incomplete",
+                            "reason": termination_reason,
+                            **(outcome_monitor.evidence() if outcome_monitor is not None else {}),
+                        }
             finally:
                 console.close()
         except Exception as exc:
             termination_reason = f"runner_error:{type(exc).__name__}:{exc}"
             run_status = "failed" if ready_at is None else "incomplete"
+            if mission_run and mission_outcome is None:
+                mission_outcome = {
+                    "category": "incomplete" if ready_at is not None else "failed",
+                    "reason": "runner_error",
+                }
         finally:
             if block is not None:
                 try:
@@ -525,6 +580,12 @@ class ExperimentRunner:
                 block.close(remove=True)
 
         ended_at = time.monotonic()
+        if mission_run and mission_outcome is None:
+            mission_outcome = {
+                "category": "incomplete" if run_status == "incomplete" else "failed",
+                "reason": termination_reason,
+                **(outcome_monitor.evidence() if outcome_monitor is not None else {}),
+            }
         sitl_log_files = sorted(str(path) for path in sitl_dir.rglob("*.BIN"))
         record = {
             "run_id": run_id,
@@ -556,6 +617,13 @@ class ExperimentRunner:
                 "path": None if mission_file is None else str(Path(mission_file).resolve()),
                 "items_uploaded": mission_count,
                 "takeoff_gate": None if not mission_run else mission_gate,
+                "outcome": mission_outcome,
+                "thresholds": None if not mission_run else {
+                    "deviation_limit_m": DEFAULT_DEVIATION_LIMIT_M,
+                    "landing_radius_m": DEFAULT_DEVIATION_LIMIT_M,
+                    "progress_timeout_s": DEFAULT_PROGRESS_TIMEOUT_S,
+                    "disarmed_landing_altitude_limit_m": LANDED_RELATIVE_ALTITUDE_M,
+                },
             },
             "communication_fault_injection": {
                 "heartbeat_stop_after_s": heartbeat_stop_after_s,

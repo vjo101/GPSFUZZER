@@ -54,8 +54,12 @@ class FakeConnection:
 
     def __init__(self):
         self.mav = self.Mav()
+        self.mission_messages = []
+        self.mission_started = False
 
     def recv_match(self, blocking=False):
+        if self.mission_started and self.mission_messages:
+            return self.mission_messages.pop(0)
         return None
 
     def close(self):
@@ -70,17 +74,26 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "out of range"):
             ExperimentRunner._validate_location("91,24,100,0")
 
-    def _runner(self, root, block, timeout=5.0):
+    def _runner(self, root, block, timeout=5.0, mavlink_factory=FakeConnection):
         return ExperimentRunner(
             root / "ardupilot",
             root / "results",
             process_factory=lambda *args, **kwargs: FakeProcess(),
-            mavlink_factory=FakeConnection,
+            mavlink_factory=mavlink_factory,
             block_factory=lambda: block,
             process_stopper=lambda process: None,
             ready_timeout_s=timeout,
             poll_interval_s=0.001,
             heartbeat_interval_s=0.01,
+        )
+
+    @staticmethod
+    def _write_mission(path):
+        path.write_text(
+            "QGC WPL 110\n"
+            "0\t1\t0\t16\t0\t0\t0\t0\t60.0\t24.0\t100\t1\n"
+            "1\t0\t3\t21\t0\t0\t0\t0\t60.0\t24.0\t0\t1\n",
+            encoding="utf-8",
         )
 
     def test_baseline_disables_hook_and_records_outputs(self):
@@ -126,17 +139,41 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             mission_path = root / "mission.txt"
-            mission_path.write_text("QGC WPL 110\n")
+            self._write_mission(mission_path)
             block = FakeBlock()
+            connection = FakeConnection()
+
+            class TelemetryMessage:
+                def __init__(self, kind, **fields):
+                    self.kind = kind
+                    self.__dict__.update(fields)
+
+                def get_type(self):
+                    return self.kind
+
+                def to_dict(self):
+                    return {key: value for key, value in self.__dict__.items() if key != "kind"}
 
             def upload_and_fly(connection, path, **callbacks):
                 callbacks["on_takeoff_started"](150)
                 callbacks["on_takeoff"](200)
                 callbacks["on_auto_confirmed"](250)
+                connection.mission_messages = [
+                    TelemetryMessage("MISSION_CURRENT", seq=1),
+                    TelemetryMessage("MISSION_ITEM_REACHED", seq=1),
+                    TelemetryMessage("EXTENDED_SYS_STATE", landed_state=1),
+                    TelemetryMessage(
+                        "GLOBAL_POSITION_INT", lat=600_000_000, lon=240_000_000,
+                        relative_alt=0,
+                    ),
+                ]
+                connection.mission_started = True
                 return 2
 
             with patch("gpsfuzzer.mission.upload_and_start_mission", upload_and_fly):
-                result = self._runner(root, block).run(
+                result = self._runner(
+                    root, block, mavlink_factory=lambda: connection,
+                ).run(
                     ExperimentConfig(
                         seed=5,
                         duration_s=0.005,
@@ -150,6 +187,12 @@ class RunnerTests(unittest.TestCase):
                 )
 
             record = json.loads(result.record_path.read_text())
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(record["mission"]["outcome"]["category"], "success")
+            self.assertEqual(record["mission"]["outcome"]["reason"], "landed_at_final_waypoint")
+            self.assertEqual(record["mission"]["thresholds"]["deviation_limit_m"], 15.0)
+            self.assertEqual(record["mission"]["thresholds"]["progress_timeout_s"], 90.0)
+            self.assertEqual(record["telemetry_messages"], 4)
             commands = [command for command in block.commands if len(command) == 12]
             self.assertEqual(commands[0][5], 0)
             self.assertEqual(commands[0][3], 1)
@@ -171,7 +214,7 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             mission_path = root / "mission.txt"
-            mission_path.write_text("QGC WPL 110\n")
+            self._write_mission(mission_path)
             block = FakeBlock()
 
             def never_takes_off(connection, path, **callbacks):
@@ -194,6 +237,34 @@ class RunnerTests(unittest.TestCase):
             self.assertIsNone(record["mission"]["takeoff_gate"]["drift_command_sequence"])
             self.assertIsNone(record["mission"]["takeoff_gate"]["hook_ack_simulation_time_us"])
             self.assertTrue(all(command[5] == 0 for command in block.commands if len(command) == 12))
+            self.assertTrue(Path(record["log_paths"]["telemetry"]).exists())
+
+    def test_mission_duration_expiry_without_an_outcome_is_incomplete(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mission_path = root / "mission.txt"
+            self._write_mission(mission_path)
+            block = FakeBlock()
+
+            def upload_and_fly(connection, path, **callbacks):
+                callbacks["on_takeoff_started"](100)
+                callbacks["on_takeoff"](200)
+                callbacks["on_auto_confirmed"](300)
+                return 2
+
+            with patch("gpsfuzzer.mission.upload_and_start_mission", upload_and_fly):
+                result = self._runner(root, block).run(
+                    ExperimentConfig(seed=9, duration_s=0.005),
+                    mission_file=mission_path,
+                )
+
+            record = json.loads(result.record_path.read_text())
+            self.assertEqual(result.status, "incomplete")
+            self.assertEqual(result.termination_reason, "mission_duration_expired")
+            self.assertEqual(record["mission"]["outcome"]["category"], "incomplete")
+            self.assertEqual(record["mission"]["thresholds"]["landing_radius_m"], 15.0)
             self.assertTrue(Path(record["log_paths"]["telemetry"]).exists())
 
     def test_unavailable_hook_is_failed_and_record_is_retained(self):

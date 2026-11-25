@@ -23,6 +23,48 @@ after connection can be rejected with zero available mission slots. GPS drift
 stays inactive until the airborne report, then a new hook command starts the
 configured delay. A 120-second takeoff timeout records the run as incomplete.
 
+## Mission outcome monitoring
+
+After AUTO is confirmed, mission runs monitor `MISSION_CURRENT` and
+`MISSION_ITEM_REACHED` for route progress, `SIMSTATE` as SITL ground truth,
+`GLOBAL_POSITION_INT` for the reported EKF position and relative altitude,
+`EXTENDED_SYS_STATE` for confirmed landing when available, `HEARTBEAT` armed
+state as a landing fallback, and `STATUSTEXT` for ArduCopter crash and EKF
+failsafe reports. When `SIMSTATE` is available, GPSFuzzer uses it for route
+deviation and endpoint checks so injected GPS offsets do not distort the
+measure of the aircraft's actual simulated path. `GLOBAL_POSITION_INT` remains
+in the record and is used as a fallback if simulator truth is absent.
+
+A mission succeeds after its final item is active or reached and the vehicle
+is confirmed landed within 15 metres of the endpoint. The preferred
+confirmation is `MAV_LANDED_STATE_ON_GROUND`. If ArduCopter omits that message,
+GPSFuzzer accepts a disarmed heartbeat after observing the vehicle armed,
+provided the final item is active and reported relative altitude is at most 1
+metre within 15 metres of the endpoint. The result records both the position
+source and landing confirmation signal. Crash, EKF failsafe, route deviation
+over 15 metres, and 90 seconds without mission-item progress are failures. A
+mission still unresolved when its experiment duration ends is incomplete. Runs
+without a mission keep their existing duration-based completion behavior.
+
+For route tracking, a `NAV_TAKEOFF` item's x/y is not assumed to be where
+ArduCopter begins horizontal travel: the flight can climb at home even when
+that coordinate differs. The first horizontal leg after takeoff therefore
+uses the mission home coordinate as its origin.
+
+The initial 15 metre route-deviation and endpoint radius comes from the
+threshold used in IMUFuzzer's `src/euc_dist_finder.py`; its `src/crashChecker.py`
+uses a 90 second per-waypoint no-progress timeout. GPSFuzzer adapts those
+starting values and calculates horizontal distance with latitude-aware
+geographic scaling. The thresholds are named constants in
+`gpsfuzzer/outcome.py` and are recorded in the mission section of
+`experiment.json`. That section also records the classification, reason,
+final/current mission sequence, endpoint and observed vehicle position,
+final-item active/reached flags, simulator truth and reported EKF positions,
+the selected position source, landed and armed states, landing confirmation
+source, maximum route deviation by position source, and crash/EKF status
+messages. It records the 1 metre altitude limit used for the disarmed-heartbeat
+fallback. Raw MAVLink messages continue to be saved in `telemetry.jsonl`.
+
 ArduPilot's SITL GPS path remains responsible for constructing its native
 `GPS_Data` sample. The hook in `libraries/SITL/SIM_GPS.cpp` reads the command
 and adjusts that sample before backend publication. The hook applies to the

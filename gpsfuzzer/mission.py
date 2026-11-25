@@ -1,12 +1,102 @@
 """Raw mission upload and start workflow shared by baseline and drift runs."""
 
 from pathlib import Path
+from dataclasses import dataclass
+import math
 import time
 from typing import Callable
 
 
 class MissionTakeoffTimeout(TimeoutError):
     """Raised when a guided takeoff does not reach the airborne state."""
+
+
+NAVIGATION_COMMANDS = frozenset({16, 17, 18, 19, 21, 22, 31, 82, 84, 85})
+GLOBAL_COORDINATE_FRAMES = frozenset({0, 3, 5, 6, 10, 11})
+
+
+@dataclass(frozen=True)
+class MissionWaypoint:
+    sequence: int
+    command: int
+    latitude: float
+    longitude: float
+    altitude_m: float
+
+
+@dataclass(frozen=True)
+class MissionRoute:
+    """Coordinate-bearing navigation items from a QGroundControl WPL file."""
+
+    waypoints: tuple[MissionWaypoint, ...]
+    home_waypoint: MissionWaypoint | None = None
+
+    @classmethod
+    def from_file(cls, mission_path: str | Path) -> "MissionRoute":
+        from pymavlink import mavwp
+
+        loader = mavwp.MAVWPLoader()
+        loader.load(str(mission_path))
+        return cls.from_loader(loader)
+
+    @classmethod
+    def from_loader(cls, loader) -> "MissionRoute":
+        count = loader.count()
+        waypoints: list[MissionWaypoint] = []
+        home_waypoint = None
+        for index in range(count):
+            item = loader.wp(index)
+            sequence = int(getattr(item, "seq", index))
+            command = int(getattr(item, "command", -1))
+            frame = int(getattr(item, "frame", -1))
+            # QGC WPL marks its sequence-zero home row as current. It is not
+            # an active route leg when the file contains other mission items.
+            if command not in NAVIGATION_COMMANDS or frame not in GLOBAL_COORDINATE_FRAMES:
+                continue
+            latitude = float(getattr(item, "x"))
+            longitude = float(getattr(item, "y"))
+            altitude = float(getattr(item, "z", 0.0))
+            if not all(math.isfinite(value) for value in (latitude, longitude, altitude)):
+                raise ValueError(f"mission item {sequence} contains non-finite coordinates")
+            if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                raise ValueError(f"mission item {sequence} has invalid latitude/longitude")
+            waypoint = MissionWaypoint(
+                sequence, command, latitude, longitude, altitude,
+            )
+            if count > 1 and sequence == 0 and int(getattr(item, "current", 0)) == 1:
+                home_waypoint = waypoint
+            else:
+                waypoints.append(waypoint)
+        if not waypoints:
+            raise ValueError("mission contains no coordinate-bearing navigation items")
+        waypoints.sort(key=lambda waypoint: waypoint.sequence)
+        return cls(tuple(waypoints), home_waypoint)
+
+    @property
+    def final_waypoint(self) -> MissionWaypoint:
+        return self.waypoints[-1]
+
+    def active_leg(self, sequence: int) -> tuple[MissionWaypoint, MissionWaypoint] | None:
+        """Return the previous and next navigation points for a mission sequence."""
+        target_index = next(
+            (index for index, waypoint in enumerate(self.waypoints)
+             if waypoint.sequence >= sequence),
+            None,
+        )
+        if target_index is None:
+            return None
+        target = self.waypoints[target_index]
+        if target_index == 0:
+            if self.home_waypoint is not None:
+                return self.home_waypoint, target
+            return target, target
+        previous = self.waypoints[target_index - 1]
+        # ArduCopter's NAV_TAKEOFF item establishes altitude; its WPL x/y can
+        # differ from the actual takeoff/home location and is not a reliable
+        # horizontal origin for the next route leg.
+        if previous.command == 22 and self.home_waypoint is not None:
+            previous = self.home_waypoint
+        return previous, target
 
 
 def upload_and_start_mission(

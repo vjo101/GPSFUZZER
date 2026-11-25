@@ -45,6 +45,95 @@ unavailable hook, and a stale hook status. The unavailable-hook case is
 reported failed; the stale mid-run case is reported incomplete, with
 `experiment.json` and telemetry paths retained.
 
+## Mission outcome monitor validation
+
+The mission outcome monitor records one of `success`, `failure`, or
+`incomplete`, plus a reason. Success requires the final navigation item to
+have been reached, `EXTENDED_SYS_STATE` to report landed, and the current
+position to be within the endpoint radius. Failure reasons include
+`crash_detected`, `ekf_failsafe`, `route_deviation`,
+`landing_outside_endpoint_radius`, `landing_timeout`, and
+`waypoint_progress_timeout`. SITL exit, experiment duration expiry, and runner
+interruptions remain incomplete outcomes with their termination reason.
+
+Each mission record stores the final waypoint sequence and coordinate, current
+and last-progress sequences, final-item active/reached flags, landed and armed
+state, latest vehicle position, endpoint distance, maximum route deviation,
+landing-confirmation source, safety events, and the thresholds used. The
+defaults are 15 metres for both route deviation and endpoint landing radius,
+90 seconds without progress, and 1 metre relative altitude for the disarmed
+heartbeat landing fallback. Tune these named defaults in
+`gpsfuzzer/outcome.py` after comparing false positives and missed events
+against representative missions; the applied values are copied into each
+`experiment.json` record so runs remain interpretable.
+
+Focused tests cover success evidence, endpoint miss, both timeout paths,
+deviation, crash/EKF reports and their precedence, absent mission telemetry,
+mission duration expiry, and retained JSONL telemetry. A new baseline outcome
+mission was run from the ArduPilot venv. SITL started and 4,371 telemetry
+messages were captured, but the hook remained in `STATE_STARTING` with
+acknowledged sequence 0, so the run ended as `hook_unavailable_or_not_ready`
+before mission upload. The experiment record and telemetry are retained under
+`/tmp/gpsfuzzer-outcome-results/20261125T045041.082959Z/`. The recorded SITL
+command includes `--no-rebuild`; inspection showed the `arducopter` binary
+predated the hook source. Rebuilding with `CCACHE_DIR=/tmp/ardupilot-ccache`
+and `CCACHE_TEMPDIR=/tmp` succeeded and compiled `libraries/SITL/SIM_GPS.cpp`.
+
+The rebuilt SITL accepted the short three-item test mission and retained
+telemetry, MAVProxy console/tlog, and DataFlash logs. The first attempt reported
+`route_deviation` at 18.30 metres when the vehicle was 0.34 metres from the
+endpoint because `MISSION_CURRENT` regressed from sequence 2 to 1. The monitor
+now ignores that stale backwards update. On the next run, ArduCopter reached
+the endpoint and disarmed, but did not emit `MISSION_ITEM_REACHED` for its
+terminal LAND item or any `EXTENDED_SYS_STATE`; the monitor therefore waited
+90 seconds and reported `waypoint_progress_timeout`. The monitor now accepts a
+disarmed heartbeat as landing evidence after observing the vehicle armed, when
+the final item is active and GPS reports altitude at most 1 metre within 15
+metres of the endpoint. It prefers `EXTENDED_SYS_STATE` when available and
+records the fallback source. The follow-up run
+`20261125T051500.327771Z` completed as `landed_at_final_waypoint`: all three
+mission items uploaded, 8,933 telemetry messages retained, the final
+coordinate was 0.33 metres away, relative altitude was 0.078 metres, and the
+recorded landing source was `disarmed_low_altitude_near_final_waypoint`.
+MAVProxy console/tlog and a DataFlash BIN were also retained. This confirms
+the SITL success path. Controlled SITL failure-signal runs remain outstanding;
+crash, EKF failsafe, deviation, timeout, and precedence classifications are
+currently covered by focused unit tests.
+
+The first coherent-drift run using the project `waypoints.txt` and seed
+`20261124` stopped at sequence 2 with a reported 95.22 metre route deviation.
+The vehicle was still at home (`-35.3632619, 149.1652372`) near 20 metres
+altitude. Its active route leg incorrectly started at the WPL `NAV_TAKEOFF`
+coordinate, about 90 metres from home, although ArduCopter had climbed in
+place. Route construction now uses home as the origin for the first horizontal
+leg after `NAV_TAKEOFF`; the prior result should not be treated as an actual
+95 metre drift detection. Rerun the same config and mission to measure the
+fuzzer's real drift progression with the corrected leg.
+
+The subsequent coherent-drift run `20261125T052906.000619Z` reached the
+terminal LAND item and ended with `route_deviation`; it retained 16,656
+telemetry messages, console/tlog, and DataFlash. Its effective drift was
+7.119 seconds delay, 1.513 m/s, bearing 1.232 degrees. The then-current
+monitor used `GLOBAL_POSITION_INT` and saw 15.18 metres from the final
+coordinate. Comparing the same final telemetry with `SIMSTATE` shows the
+simulated vehicle was actually 138.58 metres from the endpoint; replaying its
+positions against the corrected home-origin route crosses 15 metres of true
+route deviation at sequence 2. This demonstrates why the outcome monitor must
+prefer simulator truth over the GPS/EKF position being fuzzed. The monitor now
+uses `SIMSTATE` for SITL route and endpoint checks while retaining
+`GLOBAL_POSITION_INT` separately; rerun the drift experiment to verify this
+source selection end to end. The follow-up run
+`20261125T054056.783723Z` verified it: the seeded coherent drift ended as
+`route_deviation` at mission sequence 2 after 79.853 seconds. Simulator truth
+was 15.063 metres from the active leg while `GLOBAL_POSITION_INT` was only
+0.596 metres from it, demonstrating that classification used the physical
+SITL path rather than the mutated GPS/EKF estimate. The run retained 7,230
+telemetry messages, MAVProxy console/tlog, and a DataFlash BIN. Together with
+the successful endpoint-landing run above, the SITL success and route
+deviation scenarios are validated. Crash and EKF-failsafe message
+classification remains covered by unit tests; no separate SITL injection was
+used for those signals.
+
 An earlier upload attempt returned `MAV_MISSION_NO_SPACE` because it raced
 ArduCopter startup and checked mission capacity before the mission library
 initialized. Waiting for EKF/GPS readiness and following the reference

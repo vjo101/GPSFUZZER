@@ -1,0 +1,224 @@
+import tempfile
+import types
+import unittest
+from pathlib import Path
+
+from gpsfuzzer.mission import MissionRoute, MissionWaypoint
+from gpsfuzzer.outcome import (
+    DEFAULT_DEVIATION_LIMIT_M,
+    DEFAULT_PROGRESS_TIMEOUT_S,
+    MissionOutcomeMonitor,
+    horizontal_distance_m,
+    horizontal_distance_to_leg_m,
+)
+
+
+def message(kind, **fields):
+    return types.SimpleNamespace(get_type=lambda: kind, **fields)
+
+
+class MissionRouteTests(unittest.TestCase):
+    def test_route_uses_home_as_origin_and_skips_non_navigation_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mission.waypoints"
+            path.write_text(
+                "QGC WPL 110\n"
+                "0\t1\t0\t16\t0\t0\t0\t0\t60.0\t24.0\t100\t1\n"
+                "1\t0\t3\t22\t0\t0\t0\t0\t60.0001\t24.0\t10\t1\n"
+                "2\t0\t2\t178\t0\t5\t0\t0\t0\t0\t0\t1\n"
+                "3\t0\t3\t16\t0\t0\t0\t0\t60.0002\t24.0002\t10\t1\n"
+                "4\t0\t3\t21\t0\t0\t0\t0\t60.0003\t24.0003\t0\t1\n",
+                encoding="utf-8",
+            )
+            route = MissionRoute.from_file(path)
+
+        self.assertEqual([point.sequence for point in route.waypoints], [1, 3, 4])
+        self.assertEqual(route.home_waypoint.sequence, 0)
+        self.assertEqual(route.final_waypoint.command, 21)
+        self.assertEqual(
+            tuple(point.sequence for point in route.active_leg(1)),
+            (0, 1),
+        )
+        self.assertEqual(
+            tuple(point.sequence for point in route.active_leg(2)),
+            (0, 3),
+        )
+
+
+class MissionOutcomeTests(unittest.TestCase):
+    def setUp(self):
+        self.route = MissionRoute.from_file("waypoints.txt")
+
+    def test_geographic_distance_and_route_distance_use_latitude_scaling(self):
+        self.assertAlmostEqual(horizontal_distance_m(60, 24, 60, 24.001), 55.6, delta=0.5)
+        start = MissionWaypoint(1, 16, 60.0, 24.0, 10)
+        end = MissionWaypoint(2, 21, 60.0, 24.001, 0)
+        deviation = horizontal_distance_to_leg_m(
+            60.0001,
+            24.0005,
+            start,
+            end,
+        )
+        self.assertAlmostEqual(deviation, 11.1, delta=0.5)
+        self.assertEqual(DEFAULT_DEVIATION_LIMIT_M, 15.0)
+        self.assertEqual(DEFAULT_PROGRESS_TIMEOUT_S, 90.0)
+
+    def test_deviation_fails_only_when_distance_exceeds_threshold(self):
+        monitor = MissionOutcomeMonitor(self.route, started_at=0)
+        monitor.maximum_deviation_m = DEFAULT_DEVIATION_LIMIT_M
+        self.assertIsNone(monitor.evaluate(now=1))
+        monitor.maximum_deviation_m += 0.001
+        self.assertEqual(monitor.evaluate(now=1).reason, "route_deviation")
+
+    def test_stale_current_sequence_does_not_move_active_leg_backward(self):
+        monitor = MissionOutcomeMonitor(self.route, started_at=0)
+        monitor.consume(message("MISSION_CURRENT", seq=3), now=1)
+        monitor.consume(message("MISSION_CURRENT", seq=2), now=2)
+
+        self.assertEqual(monitor.current_sequence, 3)
+        self.assertEqual(monitor.last_progress_sequence, 3)
+
+        # An explicit reached event can still report a lower sequence for a
+        # mission loop and is treated as authoritative progress.
+        monitor.consume(message("MISSION_ITEM_REACHED", seq=2), now=3)
+        self.assertEqual(monitor.current_sequence, 2)
+
+    def test_success_requires_final_item_landing_and_endpoint_proximity(self):
+        monitor = MissionOutcomeMonitor(self.route, started_at=0)
+        final = self.route.final_waypoint
+        monitor.consume(message("MISSION_ITEM_REACHED", seq=final.sequence), now=10)
+        monitor.consume(message("EXTENDED_SYS_STATE", landed_state=1), now=10)
+        monitor.consume(message(
+            "GLOBAL_POSITION_INT",
+            lat=round(final.latitude * 1e7), lon=round(final.longitude * 1e7),
+            relative_alt=0,
+        ), now=10)
+
+        outcome = monitor.evaluate(now=10)
+        self.assertEqual((outcome.category, outcome.reason), ("success", "landed_at_final_waypoint"))
+        self.assertEqual(monitor.evidence()["final_waypoint_sequence"], final.sequence)
+
+    def test_terminal_land_success_uses_disarm_and_low_endpoint_position_fallback(self):
+        monitor = MissionOutcomeMonitor(self.route, started_at=0)
+        final = self.route.final_waypoint
+        monitor.consume(message("MISSION_CURRENT", seq=final.sequence), now=1)
+        monitor.consume(message("HEARTBEAT", base_mode=128), now=2)
+        monitor.consume(message(
+            "GLOBAL_POSITION_INT",
+            lat=round(final.latitude * 1e7), lon=round(final.longitude * 1e7),
+            relative_alt=85,
+        ), now=3)
+        monitor.consume(message("HEARTBEAT", base_mode=0), now=4)
+
+        outcome = monitor.evaluate(now=4)
+        self.assertEqual((outcome.category, outcome.reason), ("success", "landed_at_final_waypoint"))
+        self.assertFalse(monitor.final_waypoint_reached)
+        self.assertEqual(
+            monitor.evidence()["landing_confirmation"]["source"],
+            "disarmed_low_altitude_near_final_waypoint",
+        )
+
+    def test_disarm_away_from_endpoint_does_not_confirm_success(self):
+        route = MissionRoute((
+            MissionWaypoint(1, 16, 60.0, 24.0, 10),
+            MissionWaypoint(2, 21, 60.001, 24.0, 0),
+        ))
+        monitor = MissionOutcomeMonitor(route, started_at=0)
+        monitor.consume(message("MISSION_CURRENT", seq=route.final_waypoint.sequence), now=1)
+        monitor.consume(message("HEARTBEAT", base_mode=128), now=2)
+        previous = route.waypoints[0]
+        monitor.consume(message(
+            "GLOBAL_POSITION_INT",
+            lat=round(previous.latitude * 1e7),
+            lon=round(previous.longitude * 1e7),
+            relative_alt=0,
+        ), now=3)
+        monitor.consume(message("HEARTBEAT", base_mode=0), now=4)
+
+        self.assertIsNone(monitor.evidence()["landing_confirmation"])
+        self.assertIsNone(monitor.evaluate(now=4))
+
+    def test_simulator_truth_controls_route_and_endpoint_outcome(self):
+        route = MissionRoute((
+            MissionWaypoint(1, 16, 60.0, 24.0, 10),
+            MissionWaypoint(2, 21, 60.001, 24.0, 0),
+        ))
+        monitor = MissionOutcomeMonitor(route, started_at=0)
+        final = route.final_waypoint
+        monitor.consume(message("MISSION_CURRENT", seq=final.sequence), now=1)
+        monitor.consume(message("HEARTBEAT", base_mode=128), now=2)
+        monitor.consume(message(
+            "GLOBAL_POSITION_INT",
+            lat=round((final.latitude + 0.002) * 1e7),
+            lon=round(final.longitude * 1e7),
+            relative_alt=50,
+        ), now=3)
+        monitor.consume(message(
+            "SIMSTATE",
+            lat=round(final.latitude * 1e7),
+            lng=round(final.longitude * 1e7),
+        ), now=4)
+        monitor.consume(message("HEARTBEAT", base_mode=0), now=5)
+
+        outcome = monitor.evaluate(now=5)
+        self.assertEqual(outcome.reason, "landed_at_final_waypoint")
+        self.assertEqual(monitor.position_source, "simstate_truth")
+        self.assertEqual(monitor.endpoint_distance_m, 0)
+        self.assertGreater(monitor.maximum_reported_deviation_m, 15)
+        self.assertEqual(monitor.maximum_simulator_deviation_m, 0)
+
+    def test_endpoint_miss_fails_even_when_position_is_on_final_route_leg(self):
+        previous = MissionWaypoint(1, 16, 60.0, 24.0, 10)
+        final = MissionWaypoint(2, 21, 60.001, 24.0, 0)
+        route = MissionRoute((previous, final))
+        monitor = MissionOutcomeMonitor(route, started_at=0)
+        latitude = (final.latitude + previous.latitude) / 2
+        longitude = (final.longitude + previous.longitude) / 2
+        monitor.consume(message("MISSION_CURRENT", seq=final.sequence), now=9)
+        monitor.consume(message("MISSION_ITEM_REACHED", seq=final.sequence), now=10)
+        monitor.consume(message("EXTENDED_SYS_STATE", landed_state=1), now=10)
+        monitor.consume(message(
+            "GLOBAL_POSITION_INT", lat=round(latitude * 1e7), lon=round(longitude * 1e7),
+            relative_alt=0,
+        ), now=10)
+
+        outcome = monitor.evaluate(now=10)
+        self.assertEqual(outcome.reason, "landing_outside_endpoint_radius")
+
+    def test_waypoint_and_landing_timeouts_are_failures(self):
+        monitor = MissionOutcomeMonitor(self.route, started_at=0)
+        self.assertEqual(monitor.evaluate(now=90).reason, "waypoint_progress_timeout")
+
+        monitor = MissionOutcomeMonitor(self.route, started_at=0)
+        monitor.consume(
+            message("MISSION_ITEM_REACHED", seq=self.route.final_waypoint.sequence),
+            now=1,
+        )
+        self.assertEqual(monitor.evaluate(now=91).reason, "landing_timeout")
+
+    def test_deviation_and_safety_events_classify_failure(self):
+        monitor = MissionOutcomeMonitor(self.route, started_at=0)
+        first, second = self.route.waypoints[:2]
+        monitor.consume(message("MISSION_CURRENT", seq=second.sequence), now=1)
+        monitor.consume(message(
+            "GLOBAL_POSITION_INT",
+            lat=round((first.latitude + second.latitude) / 2 * 1e7) + 3000,
+            lon=round((first.longitude + second.longitude) / 2 * 1e7),
+            relative_alt=10000,
+        ), now=2)
+        self.assertGreater(monitor.maximum_deviation_m, DEFAULT_DEVIATION_LIMIT_M)
+        self.assertEqual(monitor.evaluate(now=2).reason, "route_deviation")
+
+        monitor = MissionOutcomeMonitor(self.route, started_at=0)
+        monitor.consume(message("STATUSTEXT", text="EKF Failsafe", severity=2), now=1)
+        monitor.consume(message("STATUSTEXT", text="Crash: Disarming", severity=0), now=1)
+        self.assertEqual(monitor.evaluate(now=1).reason, "crash_detected")
+        self.assertEqual(len(monitor.safety_events), 2)
+
+        monitor = MissionOutcomeMonitor(self.route, started_at=0)
+        monitor.consume(message("STATUSTEXT", text="EKF Failsafe", severity=2), now=1)
+        self.assertEqual(monitor.evaluate(now=1).reason, "ekf_failsafe")
+
+
+if __name__ == "__main__":
+    unittest.main()
