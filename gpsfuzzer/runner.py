@@ -340,6 +340,15 @@ class ExperimentRunner:
             "horizontal_speed_mps": config.drift.horizontal_speed_mps.__dict__,
             "bearing_deg": config.drift.bearing_deg.__dict__,
             "velocity_mode": config.drift.mode.value,
+            "mission_mutation": {
+                "waypoint_count": {
+                    "minimum": config.mission_mutation.waypoint_count[0],
+                    "maximum": config.mission_mutation.waypoint_count[1],
+                },
+                "leg_distance_m": config.mission_mutation.leg_distance_m.__dict__,
+                "bearing_deg": config.mission_mutation.bearing_deg.__dict__,
+                "altitude_m": config.mission_mutation.altitude_m.__dict__,
+            },
         }
 
         try:
@@ -678,6 +687,7 @@ class ExperimentRunner:
             },
             "mission": {
                 "path": None if mission_file is None else str(Path(mission_file).resolve()),
+                "generation": None if campaign is None else campaign.get("mission_generation"),
                 "items_uploaded": mission_count,
                 "takeoff_gate": None if not mission_run else mission_gate,
                 "outcome": mission_outcome,

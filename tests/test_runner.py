@@ -204,7 +204,10 @@ class RunnerTests(unittest.TestCase):
                 def to_dict(self):
                     return {key: value for key, value in self.__dict__.items() if key != "kind"}
 
+            uploaded_paths = []
+
             def upload_and_fly(connection, path, **callbacks):
+                uploaded_paths.append(Path(path).resolve())
                 callbacks["on_takeoff_started"](150)
                 callbacks["on_takeoff"](200)
                 callbacks["on_auto_confirmed"](250)
@@ -234,12 +237,30 @@ class RunnerTests(unittest.TestCase):
                         ),
                     ),
                     mission_file=mission_path,
+                    campaign={
+                        "mission_generation": {
+                            "enabled": True,
+                            "path": "missions/iteration-0001.waypoints",
+                            "generation_seed": 5,
+                            "settings": {"leg_distance_m": {"minimum": 60, "maximum": 240}},
+                        }
+                    },
                 )
 
             record = json.loads(result.record_path.read_text())
             self.assertEqual(result.status, "completed")
             self.assertEqual(record["mission"]["outcome"]["category"], "success")
             self.assertEqual(record["mission"]["outcome"]["reason"], "landed_at_final_waypoint")
+            self.assertEqual(uploaded_paths, [mission_path.resolve()])
+            self.assertEqual(record["mission"]["path"], str(uploaded_paths[0]))
+            self.assertEqual(
+                record["mission"]["generation"],
+                record["campaign"]["mission_generation"],
+            )
+            self.assertEqual(
+                record["configuration"]["mission_mutation"]["leg_distance_m"],
+                {"minimum": 60.0, "maximum": 240.0},
+            )
             self.assertEqual(record["mission"]["thresholds"]["deviation_limit_m"], 15.0)
             self.assertEqual(record["mission"]["thresholds"]["progress_timeout_s"], 90.0)
             self.assertEqual(record["telemetry_messages"], 4)

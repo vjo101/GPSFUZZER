@@ -10,7 +10,12 @@ import time
 from typing import Any
 
 from .config import ExperimentConfig
+from .mission_mutation import MissionGenerationResult, generate_mission
 from .runner import ExperimentRunner, RunResult
+
+
+class MissionGenerationError(ValueError):
+    """Raised when a campaign cannot create a valid per-run WPL route."""
 
 
 def derive_run_seed(campaign_seed: int, iteration_index: int) -> int:
@@ -21,6 +26,45 @@ def derive_run_seed(campaign_seed: int, iteration_index: int) -> int:
         raise ValueError("iteration_index must be a non-negative integer")
     payload = f"gpsfuzzer-campaign-v1:{campaign_seed}:{iteration_index}".encode("ascii")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _derive_mission_retry_seed(run_seed: int, retry_index: int) -> int:
+    payload = f"gpsfuzzer-mission-retry-v1:{run_seed}:{retry_index}".encode("ascii")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _mission_settings_dict(settings) -> dict:
+    return {
+        "waypoint_count": {"minimum": settings.waypoint_count[0], "maximum": settings.waypoint_count[1]},
+        "leg_distance_m": {
+            "minimum": settings.leg_distance_m.minimum,
+            "maximum": settings.leg_distance_m.maximum,
+        },
+        "bearing_deg": {"minimum": settings.bearing_deg.minimum, "maximum": settings.bearing_deg.maximum},
+        "altitude_m": {"minimum": settings.altitude_m.minimum, "maximum": settings.altitude_m.maximum},
+    }
+
+
+def _generate_unique_mission(
+    template_path: str | Path,
+    output_path: Path,
+    run_seed: int,
+    settings,
+    used_digests: set[str],
+) -> tuple[MissionGenerationResult, int, int, str]:
+    for retry_index in range(1024):
+        generation_seed = (
+            run_seed if retry_index == 0
+            else _derive_mission_retry_seed(run_seed, retry_index)
+        )
+        generated = generate_mission(
+            template_path, output_path, generation_seed, settings=settings
+        )
+        digest = hashlib.sha256(generated.path.read_bytes()).hexdigest()
+        if digest not in used_digests:
+            used_digests.add(digest)
+            return generated, generation_seed, retry_index, digest
+    raise ValueError("mission settings could not produce a route distinct from prior campaign iterations")
 
 
 @dataclass(frozen=True)
@@ -79,6 +123,7 @@ class CampaignRunner:
         baseline: bool = False,
         frame: str = "quad",
         mission_file: str | Path | None = None,
+        mutate_mission: bool = True,
         location: str | None = None,
         heartbeat_stop_after_s: float | None = None,
         show_map: bool = False,
@@ -88,6 +133,13 @@ class CampaignRunner:
             isinstance(iterations, bool) or not isinstance(iterations, int) or iterations <= 0
         ):
             raise ValueError("iterations must be a positive integer or None for until-stopped mode")
+        if (
+            mission_file is not None
+            and mutate_mission
+            and (iterations is None or iterations > 1)
+            and not config.mission_mutation.has_variability
+        ):
+            raise ValueError("mission mutation needs at least one non-degenerate setting for multiple iterations")
         campaign_mode = "until_stopped" if iterations is None else "fixed_count"
 
         self.results_dir.mkdir(parents=True, exist_ok=True)
@@ -96,12 +148,19 @@ class CampaignRunner:
         campaign_dir.mkdir(parents=False, exist_ok=False)
         runs_dir = campaign_dir / "runs"
         runs_dir.mkdir()
+        missions_dir = campaign_dir / "missions"
+        used_mission_digests: set[str] = set()
         summary_path = campaign_dir / "campaign.json"
         summary = {
             "campaign_id": campaign_id,
             "status": "running",
             "mode": campaign_mode,
             "campaign_seed": config.seed,
+            "mission_mutation": {
+                "enabled": mission_file is not None and mutate_mission,
+                "template_path": None if mission_file is None else str(Path(mission_file).resolve()),
+                "settings": _mission_settings_dict(config.mission_mutation),
+            },
             "requested_iterations": iterations,
             "completed_attempts": 0,
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -138,11 +197,51 @@ class CampaignRunner:
                 }
                 index += 1
                 try:
+                    effective_mission_file = mission_file
+                    if mission_file is not None and mutate_mission:
+                        missions_dir.mkdir(exist_ok=True)
+                        mission_path = missions_dir / f"iteration-{iteration:04d}.waypoints"
+                        run_metadata["mission_generation"] = {
+                            "enabled": True,
+                            "path": str(mission_path.relative_to(campaign_dir)),
+                            "run_seed": run_seed,
+                            "generation_seed": None,
+                            "retry_count": None,
+                            "sha256": None,
+                            "settings": _mission_settings_dict(run_config.mission_mutation),
+                        }
+                        try:
+                            generated, generation_seed, retry_count, digest = _generate_unique_mission(
+                                mission_file,
+                                mission_path,
+                                run_seed,
+                                run_config.mission_mutation,
+                                used_mission_digests,
+                            )
+                        except Exception as exc:
+                            raise MissionGenerationError(str(exc)) from exc
+                        run_metadata["mission_generation"].update({
+                            "generation_seed": generation_seed,
+                            "retry_count": retry_count,
+                            "sha256": digest,
+                            "settings": generated.settings,
+                        })
+                        effective_mission_file = generated.path
+                    elif mission_file is not None:
+                        run_metadata["mission_generation"] = {
+                            "enabled": False,
+                            "path": str(Path(mission_file).resolve()),
+                            "run_seed": run_seed,
+                            "generation_seed": None,
+                            "retry_count": 0,
+                            "sha256": None,
+                            "settings": None,
+                        }
                     result = runner.run(
                         run_config,
                         baseline=baseline,
                         frame=frame,
-                        mission_file=mission_file,
+                        mission_file=effective_mission_file,
                         location=location,
                         heartbeat_stop_after_s=heartbeat_stop_after_s,
                         show_map=show_map,
@@ -159,18 +258,22 @@ class CampaignRunner:
                     failed_dir = runs_dir / f"iteration-{iteration:04d}-setup-error"
                     failed_dir.mkdir(exist_ok=True)
                     record_path = failed_dir / "experiment.json"
+                    if isinstance(exc, MissionGenerationError):
+                        termination_reason = f"mission_generation_error:{exc.__cause__ or exc}"
+                    else:
+                        termination_reason = f"campaign_runner_error:{type(exc).__name__}:{exc}"
                     error_record = {
                         **run_metadata,
                         "run_id": failed_dir.name,
                         "seed": run_seed,
                         "status": "failed",
-                        "termination_reason": f"campaign_runner_error:{type(exc).__name__}:{exc}",
+                        "termination_reason": termination_reason,
                     }
                     record_path.write_text(json.dumps(error_record, indent=2) + "\n", encoding="utf-8")
                     entry = {
                         **run_metadata,
                         "status": "failed",
-                        "termination_reason": error_record["termination_reason"],
+                        "termination_reason": termination_reason,
                         "record": str(record_path.relative_to(campaign_dir)),
                         "effective_drift": None,
                     }

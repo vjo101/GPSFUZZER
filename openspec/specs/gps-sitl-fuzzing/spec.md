@@ -130,3 +130,93 @@ For mission experiments, GPSFuzzer SHALL monitor mission progress, vehicle state
 #### Scenario: Run without a mission
 - **WHEN** an experiment runs without a mission file
 - **THEN** GPSFuzzer retains the existing duration-based completion behavior and does not apply mission outcome classification
+
+### Requirement: Run a fixed-size GPS fuzzing campaign
+The fuzzer SHALL accept a positive campaign iteration count and attempt exactly that many independent SITL experiments when the campaign is not interrupted by the user.
+
+#### Scenario: Campaign reaches its requested iteration count
+- **WHEN** a campaign is started with an iteration count N and runs are not interrupted
+- **THEN** the fuzzer starts N independent SITL experiments and records the requested and completed attempt counts
+
+#### Scenario: Reject an invalid iteration count
+- **WHEN** a campaign is configured with an iteration count that is not a positive integer
+- **THEN** the fuzzer reports a configuration error before launching SITL
+
+### Requirement: Run a GPS fuzzing campaign until stopped
+The fuzzer SHALL support an opt-in unbounded campaign mode that runs independent SITL experiments sequentially until the user requests stop.
+
+#### Scenario: Campaign continues after each result
+- **WHEN** a campaign is started with `--until-stopped` and no stop is requested
+- **THEN** the fuzzer starts another independent experiment after each result, including mission failure or incomplete outcomes
+
+#### Scenario: User stops an active campaign
+- **WHEN** the user presses Ctrl-C during an experiment or between experiments in an until-stopped campaign
+- **THEN** the fuzzer stops launching new experiments, cleans up the active SITL process group, and records an interrupted campaign with the actual attempt count
+
+#### Scenario: Until-stopped conflicts with an explicit fixed count
+- **WHEN** the user supplies both `--until-stopped` and `--iterations N`
+- **THEN** the fuzzer reports an option conflict before launching SITL
+
+### Requirement: Sample a reproducible GPS attack for every campaign iteration
+The fuzzer SHALL derive a distinct deterministic per-run seed from the campaign seed and iteration number, then sample that run's GPS drift parameters from the configured ranges using the per-run seed.
+
+#### Scenario: Campaign iterations use distinct attack samples
+- **WHEN** a campaign runs multiple iterations with non-degenerate drift ranges
+- **THEN** each iteration uses its own per-run seed and samples its attack independently of the other iterations
+
+#### Scenario: Campaign can be reproduced
+- **WHEN** a campaign is rerun with the same campaign seed, configuration, and iteration count
+- **THEN** each iteration receives the same per-run seed and effective GPS attack parameters as the corresponding iteration in the original campaign
+
+### Requirement: Record campaign and iteration results independently
+The fuzzer SHALL retain a separate experiment record and available telemetry and SITL logs for every attempted iteration, and SHALL associate each record with the campaign identifier, campaign mode, campaign seed, iteration number, requested iteration count (or null for an until-stopped campaign), per-run seed, effective GPS attack, and outcome.
+
+#### Scenario: Iteration results are retained
+- **WHEN** a campaign iteration ends
+- **THEN** its experiment record and available telemetry and SITL logs are stored in a run-specific location and referenced by the campaign summary
+
+#### Scenario: Mission failure does not stop later iterations
+- **WHEN** a mission iteration ends with a failure or incomplete outcome
+- **THEN** the fuzzer records that outcome and proceeds to the next iteration until the requested count is reached
+
+### Requirement: Clean up all SITL processes after an experiment
+After obtaining an experiment result, the fuzzer SHALL stop and reap the SITL process and every process it launched for that experiment, including MAVProxy map or console processes when enabled, before returning the result or starting another iteration.
+
+#### Scenario: Experiment ends with a result
+- **WHEN** an experiment completes with a success, failure, or incomplete outcome, with or without the map or console enabled
+- **THEN** the fuzzer has stopped and reaped its SITL and MAVProxy processes before returning the result
+
+#### Scenario: User interrupts an experiment
+- **WHEN** the user interrupts an active experiment
+- **THEN** the fuzzer stops and reaps all processes launched for that experiment before exiting, while retaining the available experiment records and logs
+
+### Requirement: Generate a reproducible mission for each campaign iteration
+For each mutation-enabled campaign iteration with a mission template, GPSFuzzer SHALL use the iteration seed to generate a valid route, primarily sampling each leg's horizontal distance and bearing and secondarily its altitude. Segment duration SHALL emerge from route geometry and vehicle behavior, not randomized dwell. The route SHALL retain template home and takeoff/waypoints/land structure; record settings and exact WPL artifact.
+
+#### Scenario: Campaign iterations explore different routes
+- **WHEN** a campaign has mission mutation enabled and starts multiple iterations
+- **THEN** each iteration executes a distinct generated route derived from its own run seed
+
+#### Scenario: Campaign routes can be reproduced
+- **WHEN** a campaign is repeated with the same seed, mission template, generation settings, and iteration order
+- **THEN** each iteration generates the same WPL route as its corresponding prior run
+
+#### Scenario: Leg spacing and heading are sampled within configured bounds
+- **WHEN** GPSFuzzer generates a route with valid distance and bearing ranges
+- **THEN** each waypoint is placed using a sampled horizontal leg distance and bearing within those ranges, with altitude sampled from its own configured bounds
+
+#### Scenario: Segment duration follows route execution
+- **WHEN** GPSFuzzer generates a mission route
+- **THEN** it does not randomize waypoint dwell time, and observed time per leg depends on the generated distance and vehicle behavior
+
+#### Scenario: Generated mission is used consistently
+- **WHEN** a route is generated for an iteration
+- **THEN** GPSFuzzer uploads that route, evaluates mission outcomes against that route, and stores the exact WPL artifact with the experiment record
+
+#### Scenario: Mission mutation is disabled
+- **WHEN** a user disables mission mutation for a run with a mission template
+- **THEN** GPSFuzzer uploads and evaluates the supplied static mission as it does today
+
+#### Scenario: Mission generation settings are invalid
+- **WHEN** mission generation is enabled with invalid bounds or a waypoint count range that cannot produce a valid route
+- **THEN** GPSFuzzer reports the configuration error before launching SITL

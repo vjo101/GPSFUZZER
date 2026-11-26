@@ -65,6 +65,26 @@ source, maximum route deviation by position source, and crash/EKF status
 messages. It records the 1 metre altitude limit used for the disarmed-heartbeat
 fallback. Raw MAVLink messages continue to be saved in `telemetry.jsonl`.
 
+## Seeded mission generation
+
+When a campaign is given a WPL mission, GPSFuzzer can use it as a home and
+takeoff template and generate a different seeded route for each iteration.
+Starting from home, it samples each leg's horizontal distance and bearing,
+then places the next waypoint relative to the previous one. Altitude is sampled
+secondarily. The provisional defaults are 3–6 generated waypoints, 60–240 m
+per leg, bearings from 0–360 degrees clockwise from north, and 10–30 m relative
+altitude. The leg-distance range is configurable and is intended for SITL
+tuning: its lower bound is four times the current 15 m deviation threshold,
+while its upper bound is near the roughly 200–240 m legs in `waypoints.txt`.
+
+Segment duration is not independently randomized and generated waypoints have
+no dwell delay. Time per leg emerges from the sampled route and vehicle
+behavior; mission progress remains subject to the current 90 second timeout.
+Each generated WPL is retained with its campaign attempt and is the same file
+used for mission upload and outcome classification. A campaign seed and
+iteration index reproduce the corresponding route. This generator is intended
+for SITL, not real-vehicle flight.
+
 ArduPilot's SITL GPS path remains responsible for constructing its native
 `GPS_Data` sample. The hook in `libraries/SITL/SIM_GPS.cpp` reads the command
 and adjusts that sample before backend publication. The hook applies to the
@@ -182,9 +202,24 @@ and `../GPSFUZZER/.venv/bin/python ./waf copter`. Then run:
   --ardupilot ../ardupilot --results results
 ```
 
-Use `--baseline` to run the same SITL workflow with mutation disabled and
-`--mission path/to/mission.txt` to upload and execute a QGroundControl WPL
-mission. Add `--iterations N` to run N independent experiments in one
+Use `--baseline` to run the same SITL workflow with GPS mutation disabled and
+`--mission path/to/mission.txt` to provide the home/takeoff template for a
+generated QGroundControl WPL route on each campaign iteration. Use
+`--no-mission-mutation` with `--mission` to upload and execute that exact WPL
+file instead. Mission-less runs do not generate routes. Mission generation
+settings can be placed in the experiment JSON:
+
+```json
+"mission_mutation": {
+  "waypoint_count": [3, 6],
+  "leg_distance_m": [60, 240],
+  "bearing_deg": [0, 360],
+  "altitude_m": [10, 30]
+}
+```
+
+`waypoint_count` is an inclusive integer range; the other ranges are inclusive
+numeric bounds in metres or degrees. Add `--iterations N` to run N independent experiments in one
 campaign; each receives a deterministic seed derived from the configured
 campaign seed and its iteration index. The default is one iteration. Each
 campaign creates `results/<campaign-id>/campaign.json` and stores experiment

@@ -1,8 +1,13 @@
+import json
 import unittest
 import os
+import tempfile
 import time
+from pathlib import Path
 
-from gpsfuzzer import DriftConfig, DriftMode, ExperimentConfig, NumericRange, sample_drift
+from gpsfuzzer import (
+    DriftConfig, DriftMode, ExperimentConfig, MissionMutationConfig, NumericRange, sample_drift,
+)
 from gpsfuzzer.ipc import (
     COMMAND_FORMAT,
     GPS_SHM_KEY,
@@ -54,6 +59,41 @@ class DriftConfigurationTests(unittest.TestCase):
         first = sample_drift(config, 2026)
         second = sample_drift(config, 2026)
         self.assertEqual(first, second)
+
+    def test_mission_mutation_configuration_defaults_and_validation(self):
+        defaults = MissionMutationConfig()
+        self.assertEqual(defaults.waypoint_count, (3, 6))
+        self.assertEqual(defaults.leg_distance_m, NumericRange(60, 240))
+        self.assertEqual(defaults.bearing_deg, NumericRange(0, 360))
+        self.assertEqual(defaults.altitude_m, NumericRange(10, 30))
+        with self.assertRaisesRegex(ValueError, "waypoint_count"):
+            MissionMutationConfig(waypoint_count=(4, 3))
+        with self.assertRaisesRegex(ValueError, "distance"):
+            MissionMutationConfig(leg_distance_m=NumericRange(0, 100))
+        with self.assertRaisesRegex(ValueError, "bearing"):
+            MissionMutationConfig(bearing_deg=NumericRange(0, 361))
+        with self.assertRaisesRegex(ValueError, "altitude"):
+            MissionMutationConfig(altitude_m=NumericRange(10, 121))
+
+    def test_experiment_json_parses_mission_mutation_settings(self):
+        from gpsfuzzer.__main__ import _configuration
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({
+                "seed": 42,
+                "mission_mutation": {
+                    "waypoint_count": [2, 4],
+                    "leg_distance_m": [80, 180],
+                    "bearing_deg": [45, 270],
+                    "altitude_m": [12, 26],
+                },
+            }), encoding="utf-8")
+            config = _configuration(path)
+        self.assertEqual(config.mission_mutation.waypoint_count, (2, 4))
+        self.assertEqual(config.mission_mutation.leg_distance_m, NumericRange(80, 180))
+        self.assertEqual(config.mission_mutation.bearing_deg, NumericRange(45, 270))
+        self.assertEqual(config.mission_mutation.altitude_m, NumericRange(12, 26))
 
 
 class SharedMemoryTests(unittest.TestCase):

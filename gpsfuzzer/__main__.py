@@ -4,13 +4,14 @@ import argparse
 import json
 from pathlib import Path
 
-from .config import DriftConfig, DriftMode, ExperimentConfig, NumericRange
+from .config import DriftConfig, DriftMode, ExperimentConfig, MissionMutationConfig, NumericRange
 from .campaign import CampaignRunner
 
 
 def _configuration(path: Path) -> ExperimentConfig:
     raw = json.loads(path.read_text(encoding="utf-8"))
     drift = raw.get("drift", {})
+    mission_mutation = raw.get("mission_mutation", {})
     return ExperimentConfig(
         seed=raw["seed"],
         duration_s=raw.get("duration_s", 300.0),
@@ -19,6 +20,12 @@ def _configuration(path: Path) -> ExperimentConfig:
             horizontal_speed_mps=NumericRange(*drift.get("horizontal_speed_mps", [0.5, 2])),
             bearing_deg=NumericRange(*drift.get("bearing_deg", [0, 360])),
             mode=DriftMode(drift.get("mode", "coherent")),
+        ),
+        mission_mutation=MissionMutationConfig(
+            waypoint_count=tuple(mission_mutation.get("waypoint_count", [3, 6])),
+            leg_distance_m=NumericRange(*mission_mutation.get("leg_distance_m", [60, 240])),
+            bearing_deg=NumericRange(*mission_mutation.get("bearing_deg", [0, 360])),
+            altitude_m=NumericRange(*mission_mutation.get("altitude_m", [10, 30])),
         ),
     )
 
@@ -43,6 +50,11 @@ def main() -> int:
     parser.add_argument("--baseline", action="store_true", help="run with GPS mutation disabled")
     parser.add_argument("--frame", default="quad")
     parser.add_argument("--mission", type=Path, help="optional QGroundControl WPL mission to execute")
+    parser.add_argument(
+        "--no-mission-mutation",
+        action="store_true",
+        help="execute the supplied WPL mission unchanged instead of generating a route per iteration",
+    )
     parser.add_argument("--location", help="optional LAT,LON,ALT,HEADING for SITL")
     parser.add_argument(
         "--map",
@@ -67,6 +79,7 @@ def main() -> int:
         baseline=args.baseline,
         frame=args.frame,
         mission_file=args.mission,
+        mutate_mission=not args.no_mission_mutation,
         location=args.location,
         heartbeat_stop_after_s=args.drop_heartbeat_after,
         show_map=args.map,
