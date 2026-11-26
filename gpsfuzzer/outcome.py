@@ -18,6 +18,7 @@ LANDED_RELATIVE_ALTITUDE_M = 1.0
 class MissionOutcome:
     category: str
     reason: str
+    termination_reason: str | None = None
 
 
 def horizontal_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -94,6 +95,7 @@ class MissionOutcomeMonitor:
         self.maximum_deviation_m = 0.0
         self.maximum_reported_deviation_m = 0.0
         self.maximum_simulator_deviation_m = 0.0
+        self.first_deviation: dict | None = None
         self.safety_events: list[dict] = []
 
     @staticmethod
@@ -128,13 +130,13 @@ class MissionOutcomeMonitor:
 
         if kind == "MISSION_CURRENT":
             self._record_progress(int(message.seq), observed_at)
-            self._update_geometry()
+            self._update_geometry(observed_at)
         elif kind == "MISSION_ITEM_REACHED":
             sequence = int(message.seq)
             self._record_progress(sequence, observed_at, force=True)
             if sequence >= self.route.final_waypoint.sequence:
                 self._record_final_reached(observed_at)
-            self._update_geometry()
+            self._update_geometry(observed_at)
 
         if kind == "EXTENDED_SYS_STATE":
             self.landed_state = int(message.landed_state)
@@ -158,7 +160,7 @@ class MissionOutcomeMonitor:
                 "longitude": longitude,
                 "relative_altitude_m": float(getattr(message, "relative_alt", 0)) / 1000.0,
             }
-            self._update_geometry()
+            self._update_geometry(observed_at)
             self._confirm_disarmed_landing(observed_at)
 
         if kind == "SIMSTATE":
@@ -170,7 +172,7 @@ class MissionOutcomeMonitor:
                     else self.reported_position["relative_altitude_m"]
                 ),
             }
-            self._update_geometry()
+            self._update_geometry(observed_at)
             self._confirm_disarmed_landing(observed_at)
 
     def _record_progress(self, sequence: int, observed_at: float, *, force: bool = False) -> None:
@@ -226,7 +228,7 @@ class MissionOutcomeMonitor:
                 "endpoint_distance_m": self.endpoint_distance_m,
             }
 
-    def _update_geometry(self) -> None:
+    def _update_geometry(self, observed_at: float) -> None:
         """Measure route and endpoint deviation against SITL truth when present."""
         if self.simulator_truth_position is not None:
             self.position_source = "simstate_truth"
@@ -279,16 +281,31 @@ class MissionOutcomeMonitor:
             )
             self.maximum_deviation_m = self.maximum_reported_deviation_m
 
+        if (
+            selected_deviation > self.deviation_limit_m
+            and self.first_deviation is None
+        ):
+            self.first_deviation = {
+                "distance_m": selected_deviation,
+                "threshold_m": self.deviation_limit_m,
+                "observed_monotonic_ns": round(observed_at * 1_000_000_000),
+                "position_source": self.position_source,
+            }
+
+    def _terminal_outcome(self, category: str, reason: str) -> MissionOutcome:
+        """Keep a detected deviation as the finding while preserving stop cause."""
+        if self.first_deviation is not None:
+            return MissionOutcome("failure", "route_deviation", reason)
+        return MissionOutcome(category, reason, reason)
+
     def evaluate(self, *, now: float | None = None) -> MissionOutcome | None:
-        """Return a terminal classification, retaining safety-event precedence."""
+        """Return a terminal classification; deviation alone is non-terminal."""
         current = time.monotonic() if now is None else now
         categories = {event["category"] for event in self.safety_events}
         if "crash" in categories:
-            return MissionOutcome("failure", "crash_detected")
+            return self._terminal_outcome("failure", "crash_detected")
         if "ekf_failsafe" in categories:
-            return MissionOutcome("failure", "ekf_failsafe")
-        if self.maximum_deviation_m > self.deviation_limit_m:
-            return MissionOutcome("failure", "route_deviation")
+            return self._terminal_outcome("failure", "ekf_failsafe")
 
         final_item_observed = self.final_waypoint_active or self.final_waypoint_reached
         if final_item_observed:
@@ -296,14 +313,14 @@ class MissionOutcomeMonitor:
                 if self.endpoint_distance_m is None:
                     return None
                 if self.endpoint_distance_m <= self.deviation_limit_m:
-                    return MissionOutcome("success", "landed_at_final_waypoint")
-                return MissionOutcome("failure", "landing_outside_endpoint_radius")
+                    return self._terminal_outcome("success", "landed_at_final_waypoint")
+                return self._terminal_outcome("failure", "landing_outside_endpoint_radius")
             final_item_seen_at = self.final_waypoint_reached_at or self.final_waypoint_active_at
             if final_item_seen_at is not None and current - final_item_seen_at >= self.progress_timeout_s:
-                return MissionOutcome("failure", "landing_timeout")
+                return self._terminal_outcome("failure", "landing_timeout")
 
         if current - self.last_progress_at >= self.progress_timeout_s:
-            return MissionOutcome("failure", "waypoint_progress_timeout")
+            return self._terminal_outcome("failure", "waypoint_progress_timeout")
         return None
 
     def evidence(self) -> dict:
@@ -328,6 +345,7 @@ class MissionOutcomeMonitor:
             "position_source": self.position_source,
             "endpoint_distance_m": self.endpoint_distance_m,
             "maximum_deviation_m": self.maximum_deviation_m,
+            "first_deviation": self.first_deviation,
             "maximum_reported_deviation_m": self.maximum_reported_deviation_m,
             "maximum_simulator_deviation_m": self.maximum_simulator_deviation_m,
             "thresholds": {

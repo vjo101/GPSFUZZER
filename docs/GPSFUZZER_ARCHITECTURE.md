@@ -36,15 +36,24 @@ measure of the aircraft's actual simulated path. `GLOBAL_POSITION_INT` remains
 in the record and is used as a fallback if simulator truth is absent.
 
 A mission succeeds after its final item is active or reached and the vehicle
-is confirmed landed within 15 metres of the endpoint. The preferred
-confirmation is `MAV_LANDED_STATE_ON_GROUND`. If ArduCopter omits that message,
-GPSFuzzer accepts a disarmed heartbeat after observing the vehicle armed,
-provided the final item is active and reported relative altitude is at most 1
-metre within 15 metres of the endpoint. The result records both the position
-source and landing confirmation signal. Crash, EKF failsafe, route deviation
-over 15 metres, and 90 seconds without mission-item progress are failures. A
-mission still unresolved when its experiment duration ends is incomplete. Runs
-without a mission keep their existing duration-based completion behavior.
+is confirmed landed within 15 metres of the endpoint, provided no route
+deviation finding was recorded. The preferred confirmation is
+`MAV_LANDED_STATE_ON_GROUND`. If ArduCopter omits that message, GPSFuzzer accepts
+a disarmed heartbeat after observing the vehicle armed, provided the final item
+is active and reported relative altitude is at most 1 metre within 15 metres
+of the endpoint. The result records both the position source and landing
+confirmation signal. Crossing the 15 metre route-deviation threshold records
+the first crossing time and distance and updates the maximum deviation, but
+does not stop observation. GPS drift remains active. If a later terminal
+condition occurs, a run with a deviation finding is classified as a deviation
+failure while `termination_reason` records what ended observation (for example,
+landed at the endpoint, crash, EKF failsafe, or timeout). Without a deviation
+finding, the terminal event determines the mission classification. Crash, EKF
+failsafe, 90 seconds without mission-item progress, landing timeout, endpoint
+miss, endpoint landing, SITL exit, interruption, and experiment duration remain
+observation endpoints. A mission still unresolved when its experiment duration
+ends is incomplete. Runs without a mission keep their existing duration-based
+completion behavior.
 
 For route tracking, a `NAV_TAKEOFF` item's x/y is not assumed to be where
 ArduCopter begins horizontal travel: the flight can climb at home even when
@@ -61,9 +70,10 @@ geographic scaling. The thresholds are named constants in
 final/current mission sequence, endpoint and observed vehicle position,
 final-item active/reached flags, simulator truth and reported EKF positions,
 the selected position source, landed and armed states, landing confirmation
-source, maximum route deviation by position source, and crash/EKF status
-messages. It records the 1 metre altitude limit used for the disarmed-heartbeat
-fallback. Raw MAVLink messages continue to be saved in `telemetry.jsonl`.
+source, first deviation time/distance/source, maximum route deviation by
+position source, terminal reason, and crash/EKF status messages. It records the
+1 metre altitude limit used for the disarmed-heartbeat fallback. Raw MAVLink
+messages continue to be saved in `telemetry.jsonl`.
 
 ## Seeded mission generation
 
@@ -176,12 +186,19 @@ campaign iteration does not start if process cleanup failed.
 
 ## Experiment provenance
 
-An experiment record should preserve the seed, original configuration,
+An experiment record preserves the seed, original configuration,
 effective sampled delay/speed/bearing, velocity mode, GPSFuzzer and ArduPilot
 revisions, SITL launch/settings, duration, termination reason, telemetry and
 DataFlash log paths, and hook status/acknowledgments. Raw telemetry and logs
 are retained for both baseline and drift runs; this initial architecture does
 not apply IMUFuzzer's IMU-specific feedback score.
+
+For mission runs, `mission.outcome.reason` describes the classified result and
+`mission.outcome.termination_reason` identifies the event that stopped
+observation. `first_deviation` is null until the active route distance crosses
+the configured limit; once set, it retains the first time, distance, threshold,
+and position source. Maximum deviation fields continue to update for the rest
+of the run. The top-level `termination_reason` remains the runner's stop cause.
 
 The ArduPilot integration is currently localized to
 `libraries/SITL/SIM_GPS.cpp`. The ArduCopter SITL target builds successfully

@@ -63,12 +63,31 @@ class MissionOutcomeTests(unittest.TestCase):
         self.assertEqual(DEFAULT_DEVIATION_LIMIT_M, 15.0)
         self.assertEqual(DEFAULT_PROGRESS_TIMEOUT_S, 90.0)
 
-    def test_deviation_fails_only_when_distance_exceeds_threshold(self):
+    def test_deviation_is_nonterminal_and_latches_first_and_maximum_evidence(self):
         monitor = MissionOutcomeMonitor(self.route, started_at=0)
-        monitor.maximum_deviation_m = DEFAULT_DEVIATION_LIMIT_M
-        self.assertIsNone(monitor.evaluate(now=1))
-        monitor.maximum_deviation_m += 0.001
-        self.assertEqual(monitor.evaluate(now=1).reason, "route_deviation")
+        start, end = self.route.waypoints[:2]
+        midpoint_lat = (start.latitude + end.latitude) / 2
+        midpoint_lon = (start.longitude + end.longitude) / 2
+        monitor.consume(message("MISSION_CURRENT", seq=end.sequence), now=1)
+        monitor.consume(message(
+            "SIMSTATE",
+            lat=round((midpoint_lat + 0.0002) * 1e7),
+            lng=round(midpoint_lon * 1e7),
+        ), now=2)
+        first = monitor.evidence()["first_deviation"]
+        self.assertGreater(first["distance_m"], DEFAULT_DEVIATION_LIMIT_M)
+        self.assertEqual(first["observed_monotonic_ns"], 2_000_000_000)
+        self.assertIsNone(monitor.evaluate(now=2))
+
+        monitor.consume(message(
+            "SIMSTATE",
+            lat=round((midpoint_lat + 0.0003) * 1e7),
+            lng=round(midpoint_lon * 1e7),
+        ), now=3)
+        evidence = monitor.evidence()
+        self.assertEqual(evidence["first_deviation"], first)
+        self.assertGreater(evidence["maximum_deviation_m"], first["distance_m"])
+        self.assertIsNone(monitor.evaluate(now=3))
 
     def test_stale_current_sequence_does_not_move_active_leg_backward(self):
         monitor = MissionOutcomeMonitor(self.route, started_at=0)
@@ -148,15 +167,15 @@ class MissionOutcomeTests(unittest.TestCase):
         monitor.consume(message("MISSION_CURRENT", seq=final.sequence), now=1)
         monitor.consume(message("HEARTBEAT", base_mode=128), now=2)
         monitor.consume(message(
+            "SIMSTATE",
+            lat=round(final.latitude * 1e7),
+            lng=round(final.longitude * 1e7),
+        ), now=3)
+        monitor.consume(message(
             "GLOBAL_POSITION_INT",
             lat=round((final.latitude + 0.002) * 1e7),
             lon=round(final.longitude * 1e7),
             relative_alt=50,
-        ), now=3)
-        monitor.consume(message(
-            "SIMSTATE",
-            lat=round(final.latitude * 1e7),
-            lng=round(final.longitude * 1e7),
         ), now=4)
         monitor.consume(message("HEARTBEAT", base_mode=0), now=5)
 
@@ -196,6 +215,61 @@ class MissionOutcomeTests(unittest.TestCase):
         )
         self.assertEqual(monitor.evaluate(now=91).reason, "landing_timeout")
 
+    def test_deviation_followed_by_landing_is_failure_with_landing_stop_cause(self):
+        monitor = MissionOutcomeMonitor(self.route, started_at=0)
+        first, second = self.route.waypoints[:2]
+        midpoint_lat = (first.latitude + second.latitude) / 2
+        midpoint_lon = (first.longitude + second.longitude) / 2
+        monitor.consume(message("MISSION_CURRENT", seq=second.sequence), now=1)
+        monitor.consume(message(
+            "SIMSTATE",
+            lat=round((midpoint_lat + 0.0002) * 1e7),
+            lng=round(midpoint_lon * 1e7),
+        ), now=2)
+        final = self.route.final_waypoint
+        monitor.consume(message("MISSION_ITEM_REACHED", seq=final.sequence), now=3)
+        monitor.consume(message("EXTENDED_SYS_STATE", landed_state=1), now=4)
+        monitor.consume(message(
+            "SIMSTATE",
+            lat=round(final.latitude * 1e7),
+            lng=round(final.longitude * 1e7),
+        ), now=4)
+
+        outcome = monitor.evaluate(now=4)
+        self.assertEqual((outcome.category, outcome.reason), ("failure", "route_deviation"))
+        self.assertEqual(outcome.termination_reason, "landed_at_final_waypoint")
+
+    def test_deviation_followed_by_waypoint_or_landing_timeout_keeps_terminal_cause(self):
+        first, second = self.route.waypoints[:2]
+        midpoint_lat = (first.latitude + second.latitude) / 2
+        midpoint_lon = (first.longitude + second.longitude) / 2
+
+        monitor = MissionOutcomeMonitor(self.route, progress_timeout_s=5, started_at=0)
+        monitor.consume(message("MISSION_CURRENT", seq=second.sequence), now=1)
+        monitor.consume(message(
+            "SIMSTATE",
+            lat=round((midpoint_lat + 0.0002) * 1e7),
+            lng=round(midpoint_lon * 1e7),
+        ), now=2)
+        outcome = monitor.evaluate(now=7)
+        self.assertEqual((outcome.category, outcome.reason), ("failure", "route_deviation"))
+        self.assertEqual(outcome.termination_reason, "waypoint_progress_timeout")
+
+        monitor = MissionOutcomeMonitor(self.route, progress_timeout_s=5, started_at=0)
+        monitor.consume(message("MISSION_CURRENT", seq=second.sequence), now=1)
+        monitor.consume(message(
+            "SIMSTATE",
+            lat=round((midpoint_lat + 0.0002) * 1e7),
+            lng=round(midpoint_lon * 1e7),
+        ), now=2)
+        monitor.consume(
+            message("MISSION_ITEM_REACHED", seq=self.route.final_waypoint.sequence),
+            now=3,
+        )
+        outcome = monitor.evaluate(now=8)
+        self.assertEqual((outcome.category, outcome.reason), ("failure", "route_deviation"))
+        self.assertEqual(outcome.termination_reason, "landing_timeout")
+
     def test_deviation_and_safety_events_classify_failure(self):
         monitor = MissionOutcomeMonitor(self.route, started_at=0)
         first, second = self.route.waypoints[:2]
@@ -207,7 +281,7 @@ class MissionOutcomeTests(unittest.TestCase):
             relative_alt=10000,
         ), now=2)
         self.assertGreater(monitor.maximum_deviation_m, DEFAULT_DEVIATION_LIMIT_M)
-        self.assertEqual(monitor.evaluate(now=2).reason, "route_deviation")
+        self.assertIsNone(monitor.evaluate(now=2))
 
         monitor = MissionOutcomeMonitor(self.route, started_at=0)
         monitor.consume(message("STATUSTEXT", text="EKF Failsafe", severity=2), now=1)
@@ -218,6 +292,19 @@ class MissionOutcomeTests(unittest.TestCase):
         monitor = MissionOutcomeMonitor(self.route, started_at=0)
         monitor.consume(message("STATUSTEXT", text="EKF Failsafe", severity=2), now=1)
         self.assertEqual(monitor.evaluate(now=1).reason, "ekf_failsafe")
+
+        monitor = MissionOutcomeMonitor(self.route, started_at=0)
+        monitor.consume(message("MISSION_CURRENT", seq=second.sequence), now=1)
+        monitor.consume(message(
+            "GLOBAL_POSITION_INT",
+            lat=round((first.latitude + second.latitude) / 2 * 1e7) + 3000,
+            lon=round((first.longitude + second.longitude) / 2 * 1e7),
+            relative_alt=10000,
+        ), now=2)
+        monitor.consume(message("STATUSTEXT", text="EKF Failsafe", severity=2), now=3)
+        outcome = monitor.evaluate(now=3)
+        self.assertEqual((outcome.category, outcome.reason), ("failure", "route_deviation"))
+        self.assertEqual(outcome.termination_reason, "ekf_failsafe")
 
 
 if __name__ == "__main__":

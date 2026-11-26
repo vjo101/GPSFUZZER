@@ -4,7 +4,7 @@
 
 - see if we can actually trigger an EKF failsafe
 
-- might need to add stuff that doesn't immediately end run once it drifts far away enough
+- Duration of runs was increased but toward the end of the run the drone keeps drifting casue of the continued GPS spoofing (could fix later on)
 
 - add feedback-guided resilience analysis
 

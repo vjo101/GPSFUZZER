@@ -278,6 +278,387 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(gate["drift_command_sequence"], 2)
             self.assertEqual(gate["hook_ack_simulation_time_us"], 1000)
 
+    def test_deviation_does_not_stop_drift_before_later_crash(self):
+        from unittest.mock import patch
+
+        class TelemetryMessage:
+            def __init__(self, kind, **fields):
+                self.kind = kind
+                self.__dict__.update(fields)
+
+            def get_type(self):
+                return self.kind
+
+            def to_dict(self):
+                return {key: value for key, value in self.__dict__.items() if key != "kind"}
+
+        class BatchedConnection(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.batches = []
+
+            def recv_match(self, blocking=False):
+                if not self.mission_started or not self.batches:
+                    return None
+                batch = self.batches[0]
+                if batch:
+                    return batch.pop(0)
+                self.batches.pop(0)
+                time.sleep(0.015)
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mission_path = root / "mission.txt"
+            self._write_mission(mission_path)
+            block = FakeBlock()
+            connection = BatchedConnection()
+
+            def upload_and_fly(connection, path, **callbacks):
+                callbacks["on_takeoff_started"](100)
+                callbacks["on_takeoff"](200)
+                callbacks["on_auto_confirmed"](300)
+                connection.batches = [
+                    [
+                        TelemetryMessage("MISSION_CURRENT", seq=1),
+                        TelemetryMessage("SIMSTATE", lat=600_002_000, lng=240_000_000),
+                    ],
+                    [TelemetryMessage("STATUSTEXT", text="Crash: Disarming", severity=0)],
+                ]
+                connection.mission_started = True
+                return 2
+
+            with patch("gpsfuzzer.mission.upload_and_start_mission", upload_and_fly):
+                result = self._runner(
+                    root, block, mavlink_factory=lambda: connection,
+                ).run(
+                    ExperimentConfig(
+                        seed=5,
+                        duration_s=1,
+                        drift=DriftConfig(
+                            start_delay_s=NumericRange(0, 0),
+                            horizontal_speed_mps=NumericRange(1, 1),
+                            bearing_deg=NumericRange(90, 90),
+                        ),
+                    ),
+                    mission_file=mission_path,
+                )
+
+            record = json.loads(result.record_path.read_text())
+            outcome = record["mission"]["outcome"]
+            self.assertEqual(result.termination_reason, "crash_detected")
+            self.assertEqual(outcome["category"], "failure")
+            self.assertEqual(outcome["reason"], "route_deviation")
+            self.assertEqual(outcome["termination_reason"], "crash_detected")
+            self.assertIsNotNone(outcome["first_deviation"])
+            self.assertGreater(outcome["maximum_deviation_m"], 15)
+            enabled_commands = [
+                command for command in block.commands
+                if len(command) == 12 and command[5] == 1
+            ]
+            self.assertGreaterEqual(len(enabled_commands), 2)
+
+    def test_deviation_then_endpoint_landing_records_both_events(self):
+        from unittest.mock import patch
+
+        class TelemetryMessage:
+            def __init__(self, kind, **fields):
+                self.kind = kind
+                self.__dict__.update(fields)
+
+            def get_type(self):
+                return self.kind
+
+            def to_dict(self):
+                return {key: value for key, value in self.__dict__.items() if key != "kind"}
+
+        class BatchedConnection(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.batches = []
+
+            def recv_match(self, blocking=False):
+                if not self.mission_started or not self.batches:
+                    return None
+                batch = self.batches[0]
+                if batch:
+                    return batch.pop(0)
+                self.batches.pop(0)
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mission_path = root / "mission.txt"
+            self._write_mission(mission_path)
+            block = FakeBlock()
+            connection = BatchedConnection()
+
+            def upload_and_fly(connection, path, **callbacks):
+                callbacks["on_takeoff_started"](100)
+                callbacks["on_takeoff"](200)
+                callbacks["on_auto_confirmed"](300)
+                connection.batches = [
+                    [
+                        TelemetryMessage("MISSION_CURRENT", seq=1),
+                        TelemetryMessage("SIMSTATE", lat=600_002_000, lng=240_000_000),
+                    ],
+                    [
+                        TelemetryMessage("MISSION_ITEM_REACHED", seq=1),
+                        TelemetryMessage("EXTENDED_SYS_STATE", landed_state=1),
+                        TelemetryMessage("SIMSTATE", lat=600_000_000, lng=240_000_000),
+                    ],
+                ]
+                connection.mission_started = True
+                return 2
+
+            with patch("gpsfuzzer.mission.upload_and_start_mission", upload_and_fly):
+                result = self._runner(
+                    root, block, mavlink_factory=lambda: connection,
+                ).run(
+                    ExperimentConfig(seed=5, duration_s=1), mission_file=mission_path,
+                )
+
+            outcome = json.loads(result.record_path.read_text())["mission"]["outcome"]
+            self.assertEqual(result.termination_reason, "landed_at_final_waypoint")
+            self.assertEqual(outcome["category"], "failure")
+            self.assertEqual(outcome["reason"], "route_deviation")
+            self.assertEqual(outcome["termination_reason"], "landed_at_final_waypoint")
+            self.assertIsNotNone(outcome["landing_confirmation"])
+
+    def test_duration_expiry_after_deviation_retains_finding_and_stop_cause(self):
+        from unittest.mock import patch
+
+        class TelemetryMessage:
+            def __init__(self, kind, **fields):
+                self.kind = kind
+                self.__dict__.update(fields)
+
+            def get_type(self):
+                return self.kind
+
+            def to_dict(self):
+                return {key: value for key, value in self.__dict__.items() if key != "kind"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mission_path = root / "mission.txt"
+            self._write_mission(mission_path)
+            block = FakeBlock()
+            connection = FakeConnection()
+
+            def upload_and_fly(connection, path, **callbacks):
+                callbacks["on_takeoff_started"](100)
+                callbacks["on_takeoff"](200)
+                callbacks["on_auto_confirmed"](300)
+                connection.mission_messages = [
+                    TelemetryMessage("MISSION_CURRENT", seq=1),
+                    TelemetryMessage("SIMSTATE", lat=600_002_000, lng=240_000_000),
+                ]
+                connection.mission_started = True
+                return 2
+
+            with patch("gpsfuzzer.mission.upload_and_start_mission", upload_and_fly):
+                result = self._runner(
+                    root, block, mavlink_factory=lambda: connection,
+                ).run(
+                    ExperimentConfig(
+                        seed=5,
+                        duration_s=0.04,
+                        drift=DriftConfig(
+                            start_delay_s=NumericRange(0, 0),
+                            horizontal_speed_mps=NumericRange(1, 1),
+                            bearing_deg=NumericRange(90, 90),
+                        ),
+                    ),
+                    mission_file=mission_path,
+                )
+
+            outcome = json.loads(result.record_path.read_text())["mission"]["outcome"]
+            self.assertEqual(result.status, "incomplete")
+            self.assertEqual(result.termination_reason, "mission_duration_expired")
+            self.assertEqual(outcome["category"], "failure")
+            self.assertEqual(outcome["reason"], "route_deviation")
+            self.assertEqual(outcome["termination_reason"], "mission_duration_expired")
+            self.assertGreaterEqual(
+                sum(1 for command in block.commands if len(command) == 12 and command[5] == 1),
+                2,
+            )
+
+    def test_sitl_exit_after_deviation_is_recorded_as_stop_cause(self):
+        from unittest.mock import patch
+
+        class TelemetryMessage:
+            def __init__(self, kind, **fields):
+                self.kind = kind
+                self.__dict__.update(fields)
+
+            def get_type(self):
+                return self.kind
+
+            def to_dict(self):
+                return {key: value for key, value in self.__dict__.items() if key != "kind"}
+
+        class ExitAfterTelemetryProcess(FakeProcess):
+            def __init__(self):
+                self.poll_count = 0
+                self.returncode = None
+
+            def poll(self):
+                self.poll_count += 1
+                if self.poll_count >= 4:
+                    self.returncode = 7
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mission_path = root / "mission.txt"
+            self._write_mission(mission_path)
+            block = FakeBlock()
+            connection = FakeConnection()
+            process = ExitAfterTelemetryProcess()
+
+            def upload_and_fly(connection, path, **callbacks):
+                callbacks["on_takeoff_started"](100)
+                callbacks["on_takeoff"](200)
+                callbacks["on_auto_confirmed"](300)
+                connection.mission_messages = [
+                    TelemetryMessage("MISSION_CURRENT", seq=1),
+                    TelemetryMessage("SIMSTATE", lat=600_002_000, lng=240_000_000),
+                ]
+                connection.mission_started = True
+                return 2
+
+            runner = ExperimentRunner(
+                root / "ardupilot",
+                root / "results",
+                process_factory=lambda *args, **kwargs: process,
+                mavlink_factory=lambda: connection,
+                block_factory=lambda: block,
+                process_stopper=lambda proc: None,
+                ready_timeout_s=1,
+                poll_interval_s=0.001,
+                heartbeat_interval_s=0.001,
+            )
+            with patch("gpsfuzzer.mission.upload_and_start_mission", upload_and_fly):
+                result = runner.run(
+                    ExperimentConfig(seed=5, duration_s=1), mission_file=mission_path,
+                )
+
+            outcome = json.loads(result.record_path.read_text())["mission"]["outcome"]
+            self.assertEqual(result.status, "incomplete")
+            self.assertEqual(result.termination_reason, "sitl_exited:7")
+            self.assertEqual(outcome["category"], "failure")
+            self.assertEqual(outcome["reason"], "route_deviation")
+            self.assertEqual(outcome["termination_reason"], "sitl_exited:7")
+
+    def test_user_interruption_after_deviation_keeps_finding_and_stop_cause(self):
+        from unittest.mock import patch
+
+        class TelemetryMessage:
+            def __init__(self, kind, **fields):
+                self.kind = kind
+                self.__dict__.update(fields)
+
+            def get_type(self):
+                return self.kind
+
+            def to_dict(self):
+                return {key: value for key, value in self.__dict__.items() if key != "kind"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mission_path = root / "mission.txt"
+            self._write_mission(mission_path)
+            block = FakeBlock()
+            connection = FakeConnection()
+
+            def upload_and_fly(connection, path, **callbacks):
+                callbacks["on_takeoff_started"](100)
+                callbacks["on_takeoff"](200)
+                callbacks["on_auto_confirmed"](300)
+                connection.mission_messages = [
+                    TelemetryMessage("MISSION_CURRENT", seq=1),
+                    TelemetryMessage("SIMSTATE", lat=600_002_000, lng=240_000_000),
+                ]
+                connection.mission_started = True
+                return 2
+
+            with (
+                patch("gpsfuzzer.mission.upload_and_start_mission", upload_and_fly),
+                patch("gpsfuzzer.runner.time.sleep", side_effect=KeyboardInterrupt),
+            ):
+                result = self._runner(
+                    root, block, mavlink_factory=lambda: connection,
+                ).run(
+                    ExperimentConfig(seed=5, duration_s=1), mission_file=mission_path,
+                )
+
+            outcome = json.loads(result.record_path.read_text())["mission"]["outcome"]
+            self.assertEqual(result.status, "incomplete")
+            self.assertEqual(result.termination_reason, "user_interrupted")
+            self.assertEqual(outcome["category"], "failure")
+            self.assertEqual(outcome["reason"], "route_deviation")
+            self.assertEqual(outcome["termination_reason"], "user_interrupted")
+
+    def test_progress_and_landing_timeouts_after_deviation_end_observation(self):
+        from unittest.mock import patch
+        from gpsfuzzer.outcome import MissionOutcomeMonitor
+
+        class TelemetryMessage:
+            def __init__(self, kind, **fields):
+                self.kind = kind
+                self.__dict__.update(fields)
+
+            def get_type(self):
+                return self.kind
+
+            def to_dict(self):
+                return {key: value for key, value in self.__dict__.items() if key != "kind"}
+
+        for terminal_reason, include_current in (
+            ("waypoint_progress_timeout", False),
+            ("landing_timeout", True),
+        ):
+            with self.subTest(terminal_reason=terminal_reason), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                mission_path = root / "mission.txt"
+                self._write_mission(mission_path)
+                block = FakeBlock()
+                connection = FakeConnection()
+
+                def upload_and_fly(connection, path, **callbacks):
+                    callbacks["on_takeoff_started"](100)
+                    callbacks["on_takeoff"](200)
+                    callbacks["on_auto_confirmed"](300)
+                    telemetry = []
+                    if include_current:
+                        telemetry.append(TelemetryMessage("MISSION_CURRENT", seq=1))
+                    telemetry.append(
+                        TelemetryMessage("SIMSTATE", lat=600_002_000, lng=240_000_000)
+                    )
+                    connection.mission_messages = telemetry
+                    connection.mission_started = True
+                    return 2
+
+                def short_timeout_monitor(route, **kwargs):
+                    return MissionOutcomeMonitor(route, progress_timeout_s=0.01, **kwargs)
+
+                with (
+                    patch("gpsfuzzer.mission.upload_and_start_mission", upload_and_fly),
+                    patch("gpsfuzzer.runner.MissionOutcomeMonitor", side_effect=short_timeout_monitor),
+                ):
+                    result = self._runner(
+                        root, block, mavlink_factory=lambda: connection,
+                    ).run(
+                        ExperimentConfig(seed=5, duration_s=0.2), mission_file=mission_path,
+                    )
+
+                outcome = json.loads(result.record_path.read_text())["mission"]["outcome"]
+                self.assertEqual(result.termination_reason, terminal_reason)
+                self.assertEqual(outcome["category"], "failure")
+                self.assertEqual(outcome["reason"], "route_deviation")
+                self.assertEqual(outcome["termination_reason"], terminal_reason)
+
     def test_mission_takeoff_timeout_is_incomplete_and_keeps_hook_inactive(self):
         from unittest.mock import patch
         from gpsfuzzer.mission import MissionTakeoffTimeout

@@ -77,6 +77,25 @@ class ExperimentRunner:
         )
 
     @staticmethod
+    def _mission_outcome_record(
+        monitor: MissionOutcomeMonitor | None,
+        category: str,
+        reason: str,
+        termination_reason: str,
+    ) -> dict:
+        """Serialize a finding separately from the event ending observation."""
+        evidence = {} if monitor is None else monitor.evidence()
+        if monitor is not None and monitor.first_deviation is not None:
+            category = "failure"
+            reason = "route_deviation"
+        return {
+            "category": category,
+            "reason": reason,
+            "termination_reason": termination_reason,
+            **evidence,
+        }
+
+    @staticmethod
     def _revision(repository: Path) -> dict | None:
         try:
             commit = subprocess.check_output(
@@ -563,12 +582,13 @@ class ExperimentRunner:
                         if outcome_monitor is not None:
                             detected = outcome_monitor.evaluate(now=time.monotonic())
                             if detected is not None:
-                                mission_outcome = {
-                                    "category": detected.category,
-                                    "reason": detected.reason,
-                                    **outcome_monitor.evidence(),
-                                }
-                                termination_reason = detected.reason
+                                termination_reason = detected.termination_reason or detected.reason
+                                mission_outcome = self._mission_outcome_record(
+                                    outcome_monitor,
+                                    detected.category,
+                                    detected.reason,
+                                    termination_reason,
+                                )
                                 run_status = "completed" if detected.category == "success" else "failed"
                                 break
                         if not telemetry_requested:
@@ -578,30 +598,29 @@ class ExperimentRunner:
                         if run_status == "completed" and termination_reason == "duration_elapsed":
                             run_status = "incomplete"
                             termination_reason = "mission_duration_expired"
-                        mission_outcome = {
-                            "category": "incomplete",
-                            "reason": termination_reason,
-                            **(outcome_monitor.evidence() if outcome_monitor is not None else {}),
-                        }
+                        mission_outcome = self._mission_outcome_record(
+                            outcome_monitor, "incomplete", termination_reason,
+                            termination_reason,
+                        )
             finally:
                 console.close()
         except KeyboardInterrupt:
             termination_reason = "user_interrupted"
             run_status = "incomplete"
             if mission_run and mission_outcome is None:
-                mission_outcome = {
-                    "category": "incomplete",
-                    "reason": "user_interrupted",
-                    **(outcome_monitor.evidence() if outcome_monitor is not None else {}),
-                }
+                mission_outcome = self._mission_outcome_record(
+                    outcome_monitor, "incomplete", "user_interrupted", "user_interrupted",
+                )
         except Exception as exc:
             termination_reason = f"runner_error:{type(exc).__name__}:{exc}"
             run_status = "failed" if ready_at is None else "incomplete"
             if mission_run and mission_outcome is None:
-                mission_outcome = {
-                    "category": "incomplete" if ready_at is not None else "failed",
-                    "reason": "runner_error",
-                }
+                mission_outcome = self._mission_outcome_record(
+                    outcome_monitor,
+                    "incomplete" if ready_at is not None else "failed",
+                    "runner_error",
+                    termination_reason,
+                )
         finally:
             if block is not None:
                 try:
@@ -645,11 +664,12 @@ class ExperimentRunner:
 
         ended_at = time.monotonic()
         if mission_run and mission_outcome is None:
-            mission_outcome = {
-                "category": "incomplete" if run_status == "incomplete" else "failed",
-                "reason": termination_reason,
-                **(outcome_monitor.evidence() if outcome_monitor is not None else {}),
-            }
+            mission_outcome = self._mission_outcome_record(
+                outcome_monitor,
+                "incomplete" if run_status == "incomplete" else "failed",
+                termination_reason,
+                termination_reason,
+            )
         sitl_log_files = sorted(str(path) for path in sitl_dir.rglob("*.BIN"))
         if cleanup_errors:
             run_status = "failed"
