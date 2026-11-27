@@ -88,11 +88,21 @@ class ExperimentConfig:
     drift: DriftConfig = DriftConfig()
     duration_s: float = 300.0
     mission_mutation: MissionMutationConfig = MissionMutationConfig()
+    simulation_speedup: float = 2.0
 
     def __post_init__(self) -> None:
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
             raise ValueError("seed must be an integer")
         if not math.isfinite(self.duration_s) or self.duration_s <= 0:
             raise ValueError("duration must be a positive finite number of seconds")
+        if (
+            isinstance(self.simulation_speedup, bool)
+            or not isinstance(self.simulation_speedup, (int, float))
+            or not math.isfinite(self.simulation_speedup)
+            or self.simulation_speedup <= 0
+        ):
+            raise ValueError("simulation_speedup must be a positive finite number")
+        if not float(self.simulation_speedup).is_integer():
+            raise ValueError("simulation_speedup must be a whole number supported by sim_vehicle.py")
         if not isinstance(self.mission_mutation, MissionMutationConfig):
             raise ValueError("mission_mutation must be MissionMutationConfig")

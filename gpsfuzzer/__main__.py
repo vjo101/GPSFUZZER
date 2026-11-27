@@ -15,6 +15,7 @@ def _configuration(path: Path) -> ExperimentConfig:
     return ExperimentConfig(
         seed=raw["seed"],
         duration_s=raw.get("duration_s", 300.0),
+        simulation_speedup=raw.get("simulation_speedup", 2.0),
         drift=DriftConfig(
             start_delay_s=NumericRange(*drift.get("start_delay_s", [30, 60])),
             horizontal_speed_mps=NumericRange(*drift.get("horizontal_speed_mps", [0.5, 2])),

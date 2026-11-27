@@ -12,6 +12,8 @@ DEFAULT_PROGRESS_TIMEOUT_S = 90.0
 LANDED_STATE_ON_GROUND = 1
 HEARTBEAT_ARMED_FLAG = 128
 LANDED_RELATIVE_ALTITUDE_M = 1.0
+LANDED_TERRAIN_CLEARANCE_M = 1.0
+TERRAIN_REPORT_MAX_AGE_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,8 @@ class MissionOutcomeMonitor:
         self.landed_state: int | None = None
         self.armed: bool | None = None
         self.armed_seen = False
+        self.terrain_clearance_m: float | None = None
+        self.terrain_report_at: float | None = None
         self.landing_confirmation: dict | None = None
         self.reported_position: dict | None = None
         self.simulator_truth_position: dict | None = None
@@ -146,6 +150,13 @@ class MissionOutcomeMonitor:
                     "source": "extended_sys_state",
                     "observed_monotonic_ns": round(observed_at * 1_000_000_000),
                 }
+
+        if kind == "TERRAIN_REPORT":
+            clearance = float(getattr(message, "current_height", float("nan")))
+            if math.isfinite(clearance):
+                self.terrain_clearance_m = clearance
+                self.terrain_report_at = observed_at
+                self._confirm_disarmed_landing(observed_at)
 
         if kind == "HEARTBEAT":
             self.armed = bool(int(message.base_mode) & HEARTBEAT_ARMED_FLAG)
@@ -214,19 +225,38 @@ class MissionOutcomeMonitor:
         if self.landing_confirmation is not None:
             return
         position = self.vehicle_position
+        terrain_clearance_is_low = (
+            self.terrain_clearance_m is not None
+            and self.terrain_report_at is not None
+            and observed_at - self.terrain_report_at <= TERRAIN_REPORT_MAX_AGE_S
+            and self.terrain_clearance_m <= LANDED_TERRAIN_CLEARANCE_M
+        )
+        relative_altitude_is_low = (
+            position is not None
+            and position["relative_altitude_m"] is not None
+            and position["relative_altitude_m"] <= LANDED_RELATIVE_ALTITUDE_M
+        )
         if (
             self.armed_seen
             and self.armed is False
             and self.final_waypoint_active
-            and position is not None
-            and position["relative_altitude_m"] is not None
-            and position["relative_altitude_m"] <= LANDED_RELATIVE_ALTITUDE_M
+            and (relative_altitude_is_low or terrain_clearance_is_low)
             and self.endpoint_distance_m is not None
         ):
+            terrain_used = terrain_clearance_is_low and not relative_altitude_is_low
             self.landing_confirmation = {
-                "source": "disarmed_low_altitude_after_final_item",
+                "source": (
+                    "disarmed_low_terrain_clearance_after_final_item"
+                    if terrain_used
+                    else "disarmed_low_altitude_after_final_item"
+                ),
                 "observed_monotonic_ns": round(observed_at * 1_000_000_000),
-                "relative_altitude_m": position["relative_altitude_m"],
+                "relative_altitude_m": (
+                    None if position is None else position["relative_altitude_m"]
+                ),
+                "terrain_clearance_m": (
+                    self.terrain_clearance_m if terrain_used else None
+                ),
                 "endpoint_distance_m": self.endpoint_distance_m,
             }
 
@@ -345,6 +375,7 @@ class MissionOutcomeMonitor:
             ),
             "landed_state": self.landed_state,
             "armed": self.armed,
+            "terrain_clearance_m": self.terrain_clearance_m,
             "landing_confirmation": self.landing_confirmation,
             "vehicle_position": self.vehicle_position,
             "reported_vehicle_position": self.reported_position,
@@ -360,6 +391,8 @@ class MissionOutcomeMonitor:
                 "landing_radius_m": self.deviation_limit_m,
                 "progress_timeout_s": self.progress_timeout_s,
                 "disarmed_landing_altitude_limit_m": LANDED_RELATIVE_ALTITUDE_M,
+                "disarmed_landing_terrain_clearance_limit_m": LANDED_TERRAIN_CLEARANCE_M,
+                "terrain_report_max_age_s": TERRAIN_REPORT_MAX_AGE_S,
             },
             "safety_events": list(self.safety_events),
         }

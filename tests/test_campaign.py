@@ -35,6 +35,7 @@ class FakeExperimentRunner:
             1.0,
             sample_drift(config.drift, config.seed),
             record_path,
+            simulation_speedup=config.simulation_speedup,
         )
 
 
@@ -174,6 +175,20 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(len(first), len(set(first)))
         self.assertNotEqual(first, [derive_run_seed(92, index) for index in range(32)])
 
+    def test_campaign_records_explicit_one_x_reference_speed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = FakeExperimentRunner(root / "results")
+            campaign = CampaignRunner(
+                root / "ap", root / "results", experiment_runner=fake,
+            ).run(ExperimentConfig(seed=13, simulation_speedup=1.0))
+            summary = json.loads(campaign.record_path.read_text())
+        self.assertEqual(summary["simulation_speedup"], 1.0)
+        self.assertEqual(summary["runs"][0]["simulation_speedup"], {
+            "requested": 1.0,
+            "effective": 1.0,
+        })
+
     def test_campaign_groups_runs_and_continues_after_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             results_dir = Path(tmp) / "results"
@@ -189,11 +204,16 @@ class CampaignTests(unittest.TestCase):
             campaign_dir = campaign.record_path.parent
             summary = json.loads(campaign.record_path.read_text())
             self.assertEqual(summary["campaign_seed"], 17)
+            self.assertEqual(summary["simulation_speedup"], 2.0)
             self.assertEqual(summary["requested_iterations"], 3)
             self.assertEqual([run["iteration"] for run in summary["runs"]], [1, 2, 3])
             self.assertEqual([run["status"] for run in summary["runs"]], ["failed", "incomplete", "completed"])
             self.assertEqual(len({run["run_seed"] for run in summary["runs"]}), 3)
             for entry in summary["runs"]:
+                self.assertEqual(entry["simulation_speedup"], {
+                    "requested": 2.0,
+                    "effective": 2.0,
+                })
                 run_record = campaign_dir / entry["record"]
                 self.assertTrue(run_record.is_file())
                 self.assertEqual(run_record.parent.parent.name, "runs")

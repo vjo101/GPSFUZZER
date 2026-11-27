@@ -156,6 +156,7 @@ class CampaignRunner:
             "status": "running",
             "mode": campaign_mode,
             "campaign_seed": config.seed,
+            "simulation_speedup": config.simulation_speedup,
             "mission_mutation": {
                 "enabled": mission_file is not None and mutate_mission,
                 "template_path": None if mission_file is None else str(Path(mission_file).resolve()),
@@ -194,6 +195,10 @@ class CampaignRunner:
                     "iteration_index": index,
                     "requested_iterations": iterations,
                     "run_seed": run_seed,
+                    "simulation_speedup": {
+                        "requested": config.simulation_speedup,
+                        "effective": None,
+                    },
                 }
                 index += 1
                 try:
@@ -285,6 +290,10 @@ class CampaignRunner:
                 results.append(result)
                 entry = {
                     **run_metadata,
+                    "simulation_speedup": {
+                        "requested": config.simulation_speedup,
+                        "effective": result.simulation_speedup,
+                    },
                     "status": result.status,
                     "termination_reason": result.termination_reason,
                     "record": str(result.record_path.relative_to(campaign_dir)),

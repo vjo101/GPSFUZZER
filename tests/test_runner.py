@@ -116,6 +116,7 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("--cmd", args)
             self.assertIn("--map", command)
             self.assertIn("--console", command)
+            self.assertEqual(command[command.index("-S") + 1], "2")
 
     def _runner(
         self,
@@ -157,9 +158,39 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(result.status, "completed")
             self.assertIsNone(record["effective_drift"])
             self.assertEqual(record["status"], "completed")
+            self.assertEqual(record["sitl"]["simulation_speedup"]["requested"], 2.0)
+            self.assertEqual(record["sitl"]["simulation_speedup"]["effective"], 2.0)
+            self.assertTrue(record["sitl"]["simulation_speedup"]["applied"])
+            self.assertEqual(
+                record["sitl"]["command"][record["sitl"]["command"].index("-S") + 1],
+                "2",
+            )
             self.assertTrue(record["log_paths"]["telemetry"].endswith("telemetry.jsonl"))
             self.assertTrue(block.removed)
             self.assertTrue(any(command[5] == 0 for command in block.commands))
+
+    def test_explicit_simulation_speedup_is_passed_to_sitl_startup(self):
+        for speedup in (1.0, 2.0, 3.0):
+            with self.subTest(simulation_speedup=speedup):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    block = FakeBlock()
+                    result = self._runner(root, block).run(
+                        ExperimentConfig(
+                            seed=18, duration_s=0.005,
+                            simulation_speedup=speedup,
+                        ),
+                    )
+                    record = json.loads(result.record_path.read_text())
+                self.assertEqual(result.status, "completed")
+                self.assertEqual(
+                    record["sitl"]["simulation_speedup"]["effective"], speedup,
+                )
+                self.assertEqual(
+                    record["sitl"]["command"][record["sitl"]["command"].index("-S") + 1],
+                    str(int(speedup)),
+                )
+                self.assertTrue(record["sitl"]["simulation_speedup"]["applied"])
 
     def test_coherent_and_position_only_modes_are_selectable(self):
         for mode in (DriftMode.COHERENT, DriftMode.POSITION_ONLY):

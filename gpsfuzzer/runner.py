@@ -39,6 +39,7 @@ class RunResult:
     effective_drift: EffectiveDrift | None
     record_path: Path
     cleanup_complete: bool = True
+    simulation_speedup: float | None = None
 
 
 class ExperimentRunner:
@@ -144,6 +145,7 @@ class ExperimentRunner:
         frame: str,
         location: str | None,
         *,
+        simulation_speedup: float = 2.0,
         show_map: bool = False,
         show_console: bool = False,
     ) -> list[str]:
@@ -154,7 +156,7 @@ class ExperimentRunner:
             "-v", "ArduCopter", "-f", frame,
             "--no-rebuild", "--udp", "--no-extra-ports",
             "--use-dir", str(run_dir / "sitl"),
-            "-S", "1",
+            "-S", str(int(simulation_speedup)),
         ]
         if not mavproxy_enabled:
             command.append("--no-mavproxy")
@@ -331,6 +333,8 @@ class ExperimentRunner:
         mission_route = None
         outcome_monitor = None
         mission_outcome = None
+        effective_simulation_speedup = None
+        simulation_speedup_applied_monotonic_ns = None
         process = None
         connection = None
         block = None
@@ -354,6 +358,7 @@ class ExperimentRunner:
             run_dir,
             frame,
             location,
+            simulation_speedup=config.simulation_speedup,
             show_map=show_map,
             show_console=show_console,
         )
@@ -432,6 +437,7 @@ class ExperimentRunner:
         effective_config = {
             "seed": config.seed,
             "duration_s": config.duration_s,
+            "simulation_speedup": config.simulation_speedup,
             "start_delay_s": config.drift.start_delay_s.__dict__,
             "horizontal_speed_mps": config.drift.horizontal_speed_mps.__dict__,
             "bearing_deg": config.drift.bearing_deg.__dict__,
@@ -497,6 +503,8 @@ class ExperimentRunner:
                         termination_reason = "hook_unavailable_or_not_ready"
                     run_status = "failed"
                 else:
+                    effective_simulation_speedup = config.simulation_speedup
+                    simulation_speedup_applied_monotonic_ns = time.monotonic_ns()
                     mission_failed = False
                     if mission_file is not None:
                         try:
@@ -883,6 +891,13 @@ class ExperimentRunner:
                 "map_enabled": show_map,
                 "console_enabled": show_console,
                 "telemetry_port": mavlink_port,
+                "simulation_speedup": {
+                    "requested": config.simulation_speedup,
+                    "effective": effective_simulation_speedup,
+                    "applied": effective_simulation_speedup is not None,
+                    "application": "sim_vehicle_-S",
+                    "applied_monotonic_ns": simulation_speedup_applied_monotonic_ns,
+                },
             },
             "mission": {
                 "path": None if mission_file is None else str(Path(mission_file).resolve()),
@@ -915,5 +930,6 @@ class ExperimentRunner:
         record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         return RunResult(
             run_id, run_status, termination_reason,
-            round(ended_at - started_at, 3), effective, record_path, cleanup_complete,
+            round(ended_at - started_at, 3), effective, record_path,
+            cleanup_complete, effective_simulation_speedup,
         )
