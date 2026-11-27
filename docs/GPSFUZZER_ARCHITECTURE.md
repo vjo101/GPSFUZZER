@@ -39,21 +39,36 @@ A mission succeeds after its final item is active or reached and the vehicle
 is confirmed landed within 15 metres of the endpoint, provided no route
 deviation finding was recorded. The preferred confirmation is
 `MAV_LANDED_STATE_ON_GROUND`. If ArduCopter omits that message, GPSFuzzer accepts
-a disarmed heartbeat after observing the vehicle armed, provided the final item
-is active and reported relative altitude is at most 1 metre within 15 metres
-of the endpoint. The result records both the position source and landing
+a disarmed heartbeat after observing the vehicle armed, when the final item is
+active, relative altitude is at most 1 metre, and vehicle position is
+available. This confirms touchdown regardless of endpoint distance; the
+distance then determines whether the run succeeded or failed. An off-endpoint
+landing ends observation immediately instead of waiting for the 90 second
+landing timeout. If a route deviation was already recorded, the classification
+remains `route_deviation`, with the off-endpoint landing recorded as the
+termination reason. The result records both the position source and landing
 confirmation signal. Crossing the 15 metre route-deviation threshold records
 the first crossing time and distance and updates the maximum deviation, but
-does not stop observation. GPS drift remains active. If a later terminal
-condition occurs, a run with a deviation finding is classified as a deviation
-failure while `termination_reason` records what ended observation (for example,
-landed at the endpoint, crash, EKF failsafe, or timeout). Without a deviation
-finding, the terminal event determines the mission classification. Crash, EKF
-failsafe, 90 seconds without mission-item progress, landing timeout, endpoint
-miss, endpoint landing, SITL exit, interruption, and experiment duration remain
-observation endpoints. A mission still unresolved when its experiment duration
-ends is incomplete. Runs without a mission keep their existing duration-based
-completion behavior.
+does not stop observation or drift by itself. When the terminal mission item is
+a LAND command and becomes active, GPSFuzzer sends a fresh disabled command to
+the GPS mutation hook. It latches that state so later heartbeat commands cannot
+restart drift, and records the trigger time, disable sequence, hook state, and
+acknowledgment under `mission.landing_drift_disable`. If the hook does not
+acknowledge the disable, the experiment is marked incomplete while telemetry
+capture and mission monitoring continue through the terminal condition. A
+disabled hook restores native simulated GPS measurements; it does not freeze
+or rewrite `SIMSTATE`, which continues to track physical simulated motion.
+
+If a later terminal condition occurs, a run with a deviation finding is
+classified as a deviation failure while `termination_reason` records what
+ended observation (for example, landed at or outside the endpoint, crash, EKF
+failsafe, or timeout). Without a deviation finding, the terminal event determines the
+mission classification. Crash, EKF failsafe, 90 seconds without mission-item
+progress, landing timeout, endpoint miss, endpoint landing, SITL exit,
+interruption, and experiment duration remain observation endpoints. A mission
+still unresolved when its experiment duration ends is incomplete. Runs without
+a terminal LAND item and runs without a mission keep their existing drift
+behavior.
 
 For route tracking, a `NAV_TAKEOFF` item's x/y is not assumed to be where
 ArduCopter begins horizontal travel: the flight can climb at home even when
@@ -70,10 +85,11 @@ geographic scaling. The thresholds are named constants in
 final/current mission sequence, endpoint and observed vehicle position,
 final-item active/reached flags, simulator truth and reported EKF positions,
 the selected position source, landed and armed states, landing confirmation
-source, first deviation time/distance/source, maximum route deviation by
-position source, terminal reason, and crash/EKF status messages. It records the
-1 metre altitude limit used for the disarmed-heartbeat fallback. Raw MAVLink
-messages continue to be saved in `telemetry.jsonl`.
+source, terminal-LAND activation time, GPS drift disable sequence and hook
+acknowledgment, first deviation time/distance/source, maximum route deviation
+by position source, terminal reason, and crash/EKF status messages. It records
+the 1 metre altitude limit used for the disarmed-heartbeat fallback. Raw
+MAVLink messages continue to be saved in `telemetry.jsonl`.
 
 ## Seeded mission generation
 

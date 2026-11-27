@@ -15,7 +15,7 @@ from typing import Callable
 
 from .config import ExperimentConfig
 from .drift import EffectiveDrift, sample_drift
-from .mission import MissionRoute
+from .mission import MAV_CMD_NAV_LAND, MissionRoute
 from .outcome import (
     DEFAULT_DEVIATION_LIMIT_M,
     DEFAULT_PROGRESS_TIMEOUT_S,
@@ -325,6 +325,7 @@ class ExperimentRunner:
             "command_sequence": None,
             "drift_command_sequence": None,
             "hook_ack_simulation_time_us": None,
+            "landing_drift_disable": None,
         }
         mission_count = None
         mission_route = None
@@ -343,6 +344,10 @@ class ExperimentRunner:
         cleanup_errors: list[str] = []
         cleanup_complete = True
         last_publish = 0.0
+        drift_disabled = False
+        landing_disable_failed = False
+        mission_auto_confirmed = False
+        pending_outcome_messages = []
         mavproxy_enabled = show_map or show_console
         mavlink_port = 14550 if mavproxy_enabled else 5760
         command = self._sitl_command(
@@ -352,6 +357,78 @@ class ExperimentRunner:
             show_map=show_map,
             show_console=show_console,
         )
+
+        def disable_drift_for_landing(trigger_at=None, *, wait_for_ack=True) -> None:
+            nonlocal sequence, last_publish, drift_disabled, landing_disable_failed
+            nonlocal telemetry_count
+            if mission_gate["landing_drift_disable"] is not None:
+                return
+            if trigger_at is None and outcome_monitor is not None:
+                trigger_at = outcome_monitor.terminal_land_active_at
+            if trigger_at is None:
+                return
+            sequence += 1
+            mission_gate["command_sequence"] = sequence
+            disabled = {
+                "triggered_monotonic_ns": round(trigger_at * 1_000_000_000),
+                "command_sequence": sequence,
+                "acknowledged": False,
+                "acknowledged_monotonic_ns": None,
+                "hook_ack_simulation_time_us": None,
+                "hook_state": None,
+                "failure_reason": None,
+            }
+            mission_gate["landing_drift_disable"] = disabled
+            block.write_command(encode_command(
+                sequence,
+                experiment_id,
+                None,
+                published_monotonic_ns=time.monotonic_ns(),
+            ))
+            drift_disabled = True
+            last_publish = time.monotonic()
+            if not wait_for_ack:
+                return
+
+            deadline = last_publish + self.ready_timeout_s
+            while time.monotonic() < deadline:
+                if process is not None and process.poll() is not None:
+                    disabled["failure_reason"] = "sitl_exited_before_disable_ack"
+                    break
+                try:
+                    status = block.read_status()
+                except ValueError:
+                    status = None
+                if status is not None:
+                    hook_events.append({
+                        "monotonic_ns": time.monotonic_ns(),
+                        "event": "landing_drift_disable",
+                        "state": status.state,
+                        "acknowledged_sequence": status.acknowledged_sequence,
+                        "error_code": status.error_code,
+                        "simulation_time_us": status.simulation_time_us,
+                    })
+                    disabled["hook_state"] = status.state
+                    if (
+                        status.state == STATE_READY
+                        and status.acknowledged_sequence == sequence
+                    ):
+                        disabled["acknowledged"] = True
+                        disabled["acknowledged_monotonic_ns"] = time.monotonic_ns()
+                        disabled["hook_ack_simulation_time_us"] = status.simulation_time_us
+                        break
+                with telemetry_path.open("a", encoding="utf-8") as telemetry:
+                    telemetry_count_delta = self._drain_telemetry(
+                        connection,
+                        telemetry,
+                        outcome_monitor,
+                    )
+                telemetry_count += telemetry_count_delta
+                time.sleep(self.poll_interval_s)
+            if not disabled["acknowledged"]:
+                landing_disable_failed = True
+                if disabled["failure_reason"] is None:
+                    disabled["failure_reason"] = "landing_disable_unacknowledged"
         effective_config = {
             "seed": config.seed,
             "duration_s": config.duration_s,
@@ -430,11 +507,26 @@ class ExperimentRunner:
                                 if message is not None:
                                     with telemetry_path.open("a", encoding="utf-8") as telemetry:
                                         telemetry_count += self._write_telemetry_message(telemetry, message)
+                                    observed_at = time.monotonic()
+                                    if mission_auto_confirmed:
+                                        pending_outcome_messages.append((message, observed_at))
+                                        if (
+                                            mission_route.final_waypoint.command == MAV_CMD_NAV_LAND
+                                            and message.get_type() in {"MISSION_CURRENT", "MISSION_ITEM_REACHED"}
+                                            and int(message.seq) >= mission_route.final_waypoint.sequence
+                                        ):
+                                            disable_drift_for_landing(
+                                                observed_at,
+                                                wait_for_ack=False,
+                                            )
                                 now = time.monotonic()
                                 if now - last_publish >= self.heartbeat_interval_s:
                                     command_drift = (
                                         effective
-                                        if mission_gate["takeoff_detected_monotonic_ns"] is not None
+                                        if (
+                                            mission_gate["takeoff_detected_monotonic_ns"] is not None
+                                            and not drift_disabled
+                                        )
                                         else None
                                     )
                                     block.write_command(encode_command(
@@ -444,7 +536,9 @@ class ExperimentRunner:
                                     last_publish = now
 
                             def record_auto_confirmation(monotonic_ns):
+                                nonlocal mission_auto_confirmed
                                 mission_gate["auto_confirmed_monotonic_ns"] = monotonic_ns
+                                mission_auto_confirmed = True
 
                             def record_takeoff_started(monotonic_ns):
                                 mission_gate["takeoff_started_monotonic_ns"] = monotonic_ns
@@ -485,13 +579,48 @@ class ExperimentRunner:
                             ack_deadline = time.monotonic() + self.ready_timeout_s
                             while time.monotonic() < ack_deadline:
                                 if process.poll() is not None:
+                                    if mission_gate["landing_drift_disable"] is not None:
+                                        mission_gate["landing_drift_disable"]["failure_reason"] = (
+                                            "sitl_exited_before_disable_ack"
+                                        )
+                                        landing_disable_failed = True
+                                        break
                                     raise RuntimeError("SITL exited before acknowledging takeoff command")
+                                with telemetry_path.open("a", encoding="utf-8") as telemetry:
+                                    while True:
+                                        message = connection.recv_match(blocking=False)
+                                        if message is None:
+                                            break
+                                        telemetry_count += self._write_telemetry_message(
+                                            telemetry, message,
+                                        )
+                                        observed_at = time.monotonic()
+                                        pending_outcome_messages.append((message, observed_at))
+                                        if (
+                                            mission_auto_confirmed
+                                            and mission_route.final_waypoint.command == MAV_CMD_NAV_LAND
+                                            and message.get_type() in {"MISSION_CURRENT", "MISSION_ITEM_REACHED"}
+                                            and int(message.seq) >= mission_route.final_waypoint.sequence
+                                        ):
+                                            disable_drift_for_landing(
+                                                observed_at,
+                                                wait_for_ack=False,
+                                            )
                                 status = block.read_status()
                                 if (
                                     status.state == STATE_READY
                                     and status.acknowledged_sequence == mission_gate["command_sequence"]
                                 ):
                                     mission_gate["hook_ack_simulation_time_us"] = status.simulation_time_us
+                                    landing_disable = mission_gate["landing_drift_disable"]
+                                    if (
+                                        landing_disable is not None
+                                        and landing_disable["command_sequence"] == status.acknowledged_sequence
+                                    ):
+                                        landing_disable["acknowledged"] = True
+                                        landing_disable["acknowledged_monotonic_ns"] = time.monotonic_ns()
+                                        landing_disable["hook_ack_simulation_time_us"] = status.simulation_time_us
+                                        landing_disable["hook_state"] = status.state
                                     hook_events.append({
                                         "monotonic_ns": time.monotonic_ns(),
                                         "state": status.state,
@@ -501,15 +630,31 @@ class ExperimentRunner:
                                     })
                                     break
                                 if status.state in (STATE_STALE,):
+                                    if mission_gate["landing_drift_disable"] is not None:
+                                        mission_gate["landing_drift_disable"]["failure_reason"] = (
+                                            "landing_disable_hook_stale"
+                                        )
+                                        landing_disable_failed = True
+                                        break
                                     raise RuntimeError("GPS mutation hook became stale at takeoff")
                                 time.sleep(self.poll_interval_s)
                             else:
-                                raise TimeoutError("GPS mutation hook did not acknowledge takeoff command")
+                                if mission_gate["landing_drift_disable"] is not None:
+                                    mission_gate["landing_drift_disable"]["failure_reason"] = (
+                                        "landing_disable_unacknowledged"
+                                    )
+                                    landing_disable_failed = True
+                                else:
+                                    raise TimeoutError("GPS mutation hook did not acknowledge takeoff command")
                             ready_at = time.monotonic()
                             outcome_monitor = MissionOutcomeMonitor(
                                 mission_route,
                                 started_at=ready_at,
                             )
+                            for message, observed_at in pending_outcome_messages:
+                                outcome_monitor.consume(message, now=observed_at)
+                            if outcome_monitor.terminal_land_active_at is not None:
+                                disable_drift_for_landing()
                         except MissionTakeoffTimeout as exc:
                             if mission_gate["takeoff_started_monotonic_ns"] is not None:
                                 mission_gate["takeoff_wait_s"] = round(
@@ -545,13 +690,16 @@ class ExperimentRunner:
                             or now - ready_at < heartbeat_stop_after_s
                         ) and now - last_publish >= self.heartbeat_interval_s:
                             block.write_command(encode_command(
-                                sequence, experiment_id, effective,
+                                sequence, experiment_id, None if drift_disabled else effective,
                                 published_monotonic_ns=time.monotonic_ns(),
                             ))
                             last_publish = now
                         try:
                             status = block.read_status()
-                            if status.state != STATE_READY or status.acknowledged_sequence != sequence:
+                            if not landing_disable_failed and (
+                                status.state != STATE_READY
+                                or status.acknowledged_sequence != sequence
+                            ):
                                 hook_events.append({
                                     "monotonic_ns": time.monotonic_ns(),
                                     "state": status.state,
@@ -565,14 +713,15 @@ class ExperimentRunner:
                                 )
                                 run_status = "incomplete"
                                 break
-                            if not block.is_fresh():
+                            if not landing_disable_failed and not block.is_fresh():
                                 termination_reason = "hook_status_stale"
                                 run_status = "incomplete"
                                 break
                         except ValueError:
-                            termination_reason = "hook_status_invalid"
-                            run_status = "incomplete"
-                            break
+                            if not landing_disable_failed:
+                                termination_reason = "hook_status_invalid"
+                                run_status = "incomplete"
+                                break
                         with telemetry_path.open("a", encoding="utf-8") as telemetry:
                             telemetry_count += self._drain_telemetry(
                                 connection,
@@ -580,6 +729,8 @@ class ExperimentRunner:
                                 outcome_monitor if mission_run else None,
                             )
                         if outcome_monitor is not None:
+                            if outcome_monitor.terminal_land_active_at is not None:
+                                disable_drift_for_landing()
                             detected = outcome_monitor.evaluate(now=time.monotonic())
                             if detected is not None:
                                 termination_reason = detected.termination_reason or detected.reason
@@ -590,6 +741,12 @@ class ExperimentRunner:
                                     termination_reason,
                                 )
                                 run_status = "completed" if detected.category == "success" else "failed"
+                                if landing_disable_failed:
+                                    mission_outcome["mission_terminal_reason"] = termination_reason
+                                    mission_outcome["category"] = "incomplete"
+                                    mission_outcome["reason"] = "landing_disable_unacknowledged"
+                                    termination_reason = "landing_disable_unacknowledged"
+                                    run_status = "incomplete"
                                 break
                         if not telemetry_requested:
                             telemetry_requested = self._request_telemetry_streams(connection)
@@ -602,6 +759,12 @@ class ExperimentRunner:
                             outcome_monitor, "incomplete", termination_reason,
                             termination_reason,
                         )
+                        if landing_disable_failed:
+                            mission_outcome["mission_terminal_reason"] = termination_reason
+                            mission_outcome["category"] = "incomplete"
+                            mission_outcome["reason"] = "landing_disable_unacknowledged"
+                            termination_reason = "landing_disable_unacknowledged"
+                            run_status = "incomplete"
             finally:
                 console.close()
         except KeyboardInterrupt:
@@ -670,6 +833,22 @@ class ExperimentRunner:
                 termination_reason,
                 termination_reason,
             )
+        if mission_run and landing_disable_failed:
+            if mission_outcome is None:
+                mission_outcome = self._mission_outcome_record(
+                    outcome_monitor,
+                    "incomplete",
+                    "landing_disable_unacknowledged",
+                    termination_reason,
+                )
+            else:
+                mission_outcome["mission_terminal_reason"] = mission_outcome.get(
+                    "termination_reason", termination_reason,
+                )
+            mission_outcome["category"] = "incomplete"
+            mission_outcome["reason"] = "landing_disable_unacknowledged"
+            run_status = "incomplete"
+            termination_reason = "landing_disable_unacknowledged"
         sitl_log_files = sorted(str(path) for path in sitl_dir.rglob("*.BIN"))
         if cleanup_errors:
             run_status = "failed"
@@ -710,6 +889,9 @@ class ExperimentRunner:
                 "generation": None if campaign is None else campaign.get("mission_generation"),
                 "items_uploaded": mission_count,
                 "takeoff_gate": None if not mission_run else mission_gate,
+                "landing_drift_disable": (
+                    None if not mission_run else mission_gate["landing_drift_disable"]
+                ),
                 "outcome": mission_outcome,
                 "thresholds": None if not mission_run else {
                     "deviation_limit_m": DEFAULT_DEVIATION_LIMIT_M,

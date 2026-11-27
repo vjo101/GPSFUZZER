@@ -12,6 +12,7 @@ class MissionTakeoffTimeout(TimeoutError):
 
 
 NAVIGATION_COMMANDS = frozenset({16, 17, 18, 19, 21, 22, 31, 82, 84, 85})
+MAV_CMD_NAV_LAND = 21
 GLOBAL_COORDINATE_FRAMES = frozenset({0, 3, 5, 6, 10, 11})
 
 

@@ -274,11 +274,13 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(gate["takeoff_detected_monotonic_ns"], 200)
             self.assertEqual(gate["takeoff_wait_s"], 0.0)
             self.assertEqual(gate["takeoff_started_monotonic_ns"], 150)
-            self.assertEqual(gate["command_sequence"], 2)
+            self.assertEqual(gate["command_sequence"], 3)
             self.assertEqual(gate["drift_command_sequence"], 2)
             self.assertEqual(gate["hook_ack_simulation_time_us"], 1000)
+            self.assertTrue(gate["landing_drift_disable"]["acknowledged"])
+            self.assertEqual(gate["landing_drift_disable"]["command_sequence"], 3)
 
-    def test_deviation_does_not_stop_drift_before_later_crash(self):
+    def test_landing_disable_stops_drift_before_later_crash(self):
         from unittest.mock import patch
 
         class TelemetryMessage:
@@ -356,7 +358,77 @@ class RunnerTests(unittest.TestCase):
                 command for command in block.commands
                 if len(command) == 12 and command[5] == 1
             ]
-            self.assertGreaterEqual(len(enabled_commands), 2)
+            self.assertEqual(len(enabled_commands), 1)
+            disabled = record["mission"]["landing_drift_disable"]
+            self.assertTrue(disabled["acknowledged"])
+            self.assertEqual(disabled["command_sequence"], 3)
+
+    def test_unacknowledged_landing_disable_keeps_capturing_until_landing(self):
+        from unittest.mock import patch
+
+        class NoDisableAckBlock(FakeBlock):
+            def write_command(self, data):
+                command = COMMAND_FORMAT.unpack(data)
+                self.commands.append(command)
+                if command[3] < 3 or command[5] != 0:
+                    self.ack = command[3]
+
+        class TelemetryMessage:
+            def __init__(self, kind, **fields):
+                self.kind = kind
+                self.__dict__.update(fields)
+
+            def get_type(self):
+                return self.kind
+
+            def to_dict(self):
+                return {key: value for key, value in self.__dict__.items() if key != "kind"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mission_path = root / "mission.txt"
+            self._write_mission(mission_path)
+            block = NoDisableAckBlock()
+            connection = FakeConnection()
+
+            def upload_and_fly(connection, path, **callbacks):
+                callbacks["on_takeoff_started"](100)
+                callbacks["on_takeoff"](200)
+                callbacks["on_auto_confirmed"](300)
+                connection.mission_messages = [
+                    TelemetryMessage("MISSION_CURRENT", seq=1),
+                    TelemetryMessage("EXTENDED_SYS_STATE", landed_state=1),
+                    TelemetryMessage(
+                        "GLOBAL_POSITION_INT", lat=600_000_000, lon=240_000_000,
+                        relative_alt=0,
+                    ),
+                ]
+                connection.mission_started = True
+                return 2
+
+            with patch("gpsfuzzer.mission.upload_and_start_mission", upload_and_fly):
+                result = self._runner(
+                    root, block, timeout=0.03, mavlink_factory=lambda: connection,
+                ).run(
+                    ExperimentConfig(seed=5, duration_s=1),
+                    mission_file=mission_path,
+                )
+
+            record = json.loads(result.record_path.read_text())
+            self.assertEqual(result.status, "incomplete")
+            self.assertEqual(result.termination_reason, "landing_disable_unacknowledged")
+            self.assertEqual(record["mission"]["outcome"]["reason"], "landing_disable_unacknowledged")
+            self.assertEqual(
+                record["mission"]["outcome"]["mission_terminal_reason"],
+                "landed_at_final_waypoint",
+            )
+            self.assertEqual(record["telemetry_messages"], 3)
+            self.assertFalse(record["mission"]["landing_drift_disable"]["acknowledged"])
+            active_sequences = [
+                command[3] for command in block.commands
+                if len(command) == 12 and command[5] == 1
+            ]
+            self.assertEqual(active_sequences, [2])
 
     def test_deviation_then_endpoint_landing_records_both_events(self):
         from unittest.mock import patch
@@ -418,7 +490,8 @@ class RunnerTests(unittest.TestCase):
                     ExperimentConfig(seed=5, duration_s=1), mission_file=mission_path,
                 )
 
-            outcome = json.loads(result.record_path.read_text())["mission"]["outcome"]
+            record = json.loads(result.record_path.read_text())
+            outcome = record["mission"]["outcome"]
             self.assertEqual(result.termination_reason, "landed_at_final_waypoint")
             self.assertEqual(outcome["category"], "failure")
             self.assertEqual(outcome["reason"], "route_deviation")
@@ -473,16 +546,18 @@ class RunnerTests(unittest.TestCase):
                     mission_file=mission_path,
                 )
 
-            outcome = json.loads(result.record_path.read_text())["mission"]["outcome"]
+            record = json.loads(result.record_path.read_text())
+            outcome = record["mission"]["outcome"]
             self.assertEqual(result.status, "incomplete")
             self.assertEqual(result.termination_reason, "mission_duration_expired")
             self.assertEqual(outcome["category"], "failure")
             self.assertEqual(outcome["reason"], "route_deviation")
             self.assertEqual(outcome["termination_reason"], "mission_duration_expired")
-            self.assertGreaterEqual(
+            self.assertEqual(
                 sum(1 for command in block.commands if len(command) == 12 and command[5] == 1),
-                2,
+                1,
             )
+            self.assertTrue(record["mission"]["landing_drift_disable"]["acknowledged"])
 
     def test_sitl_exit_after_deviation_is_recorded_as_stop_cause(self):
         from unittest.mock import patch
@@ -550,6 +625,8 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(outcome["category"], "failure")
             self.assertEqual(outcome["reason"], "route_deviation")
             self.assertEqual(outcome["termination_reason"], "sitl_exited:7")
+            self.assertTrue(json.loads(result.record_path.read_text())[
+                "mission"]["landing_drift_disable"]["acknowledged"])
 
     def test_user_interruption_after_deviation_keeps_finding_and_stop_cause(self):
         from unittest.mock import patch

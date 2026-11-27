@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import math
 import time
 
-from .mission import MissionRoute, MissionWaypoint
+from .mission import MAV_CMD_NAV_LAND, MissionRoute, MissionWaypoint
 
 EARTH_RADIUS_M = 6_371_000.0
 DEFAULT_DEVIATION_LIMIT_M = 15.0
@@ -81,6 +81,7 @@ class MissionOutcomeMonitor:
         self.current_sequence: int | None = None
         self.final_waypoint_active = False
         self.final_waypoint_active_at: float | None = None
+        self.terminal_land_active_at: float | None = None
         self.final_waypoint_reached = False
         self.final_waypoint_reached_at: float | None = None
         self.landed_state: int | None = None
@@ -199,6 +200,8 @@ class MissionOutcomeMonitor:
         if not self.final_waypoint_active:
             self.final_waypoint_active = True
             self.final_waypoint_active_at = observed_at
+            if self.route.final_waypoint.command == MAV_CMD_NAV_LAND:
+                self.terminal_land_active_at = observed_at
 
     def _record_final_reached(self, observed_at: float) -> None:
         self._record_final_active(observed_at)
@@ -219,10 +222,9 @@ class MissionOutcomeMonitor:
             and position["relative_altitude_m"] is not None
             and position["relative_altitude_m"] <= LANDED_RELATIVE_ALTITUDE_M
             and self.endpoint_distance_m is not None
-            and self.endpoint_distance_m <= self.deviation_limit_m
         ):
             self.landing_confirmation = {
-                "source": "disarmed_low_altitude_near_final_waypoint",
+                "source": "disarmed_low_altitude_after_final_item",
                 "observed_monotonic_ns": round(observed_at * 1_000_000_000),
                 "relative_altitude_m": position["relative_altitude_m"],
                 "endpoint_distance_m": self.endpoint_distance_m,
@@ -336,6 +338,11 @@ class MissionOutcomeMonitor:
             },
             "final_waypoint_reached": self.final_waypoint_reached,
             "final_waypoint_active": self.final_waypoint_active,
+            "terminal_land_active": self.terminal_land_active_at is not None,
+            "terminal_land_active_at_monotonic_ns": (
+                None if self.terminal_land_active_at is None
+                else round(self.terminal_land_active_at * 1_000_000_000)
+            ),
             "landed_state": self.landed_state,
             "armed": self.armed,
             "landing_confirmation": self.landing_confirmation,

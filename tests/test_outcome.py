@@ -63,6 +63,44 @@ class MissionOutcomeTests(unittest.TestCase):
         self.assertEqual(DEFAULT_DEVIATION_LIMIT_M, 15.0)
         self.assertEqual(DEFAULT_PROGRESS_TIMEOUT_S, 90.0)
 
+    def test_terminal_land_activation_is_one_shot_and_requires_land_command(self):
+        land_route = MissionRoute((
+            MissionWaypoint(1, 16, 60.0, 24.0, 10),
+            MissionWaypoint(2, 21, 60.001, 24.0, 0),
+        ))
+        monitor = MissionOutcomeMonitor(land_route, started_at=0)
+        monitor.consume(message("MISSION_CURRENT", seq=1), now=1)
+        self.assertFalse(monitor.evidence()["terminal_land_active"])
+
+        monitor.consume(message("MISSION_CURRENT", seq=2), now=2)
+        monitor.consume(message("MISSION_CURRENT", seq=2), now=3)
+        evidence = monitor.evidence()
+        self.assertTrue(evidence["terminal_land_active"])
+        self.assertEqual(evidence["terminal_land_active_at_monotonic_ns"], 2_000_000_000)
+
+        non_land_route = MissionRoute((
+            MissionWaypoint(1, 16, 60.0, 24.0, 10),
+            MissionWaypoint(2, 16, 60.001, 24.0, 10),
+        ))
+        non_land_monitor = MissionOutcomeMonitor(non_land_route, started_at=0)
+        non_land_monitor.consume(message("MISSION_CURRENT", seq=2), now=4)
+        self.assertFalse(non_land_monitor.evidence()["terminal_land_active"])
+
+    def test_terminal_land_activation_responds_to_current_and_reached_messages(self):
+        route = MissionRoute((
+            MissionWaypoint(1, 16, 60.0, 24.0, 10),
+            MissionWaypoint(2, 21, 60.001, 24.0, 0),
+        ))
+        for kind in ("MISSION_CURRENT", "MISSION_ITEM_REACHED"):
+            with self.subTest(kind=kind):
+                monitor = MissionOutcomeMonitor(route, started_at=0)
+                monitor.consume(message(kind, seq=route.final_waypoint.sequence), now=5)
+                self.assertTrue(monitor.evidence()["terminal_land_active"])
+                self.assertEqual(
+                    monitor.evidence()["terminal_land_active_at_monotonic_ns"],
+                    5_000_000_000,
+                )
+
     def test_deviation_is_nonterminal_and_latches_first_and_maximum_evidence(self):
         monitor = MissionOutcomeMonitor(self.route, started_at=0)
         start, end = self.route.waypoints[:2]
@@ -117,7 +155,7 @@ class MissionOutcomeTests(unittest.TestCase):
         self.assertEqual((outcome.category, outcome.reason), ("success", "landed_at_final_waypoint"))
         self.assertEqual(monitor.evidence()["final_waypoint_sequence"], final.sequence)
 
-    def test_terminal_land_success_uses_disarm_and_low_endpoint_position_fallback(self):
+    def test_terminal_land_success_uses_disarm_and_low_altitude_fallback(self):
         monitor = MissionOutcomeMonitor(self.route, started_at=0)
         final = self.route.final_waypoint
         monitor.consume(message("MISSION_CURRENT", seq=final.sequence), now=1)
@@ -134,10 +172,10 @@ class MissionOutcomeTests(unittest.TestCase):
         self.assertFalse(monitor.final_waypoint_reached)
         self.assertEqual(
             monitor.evidence()["landing_confirmation"]["source"],
-            "disarmed_low_altitude_near_final_waypoint",
+            "disarmed_low_altitude_after_final_item",
         )
 
-    def test_disarm_away_from_endpoint_does_not_confirm_success(self):
+    def test_disarm_away_from_endpoint_confirms_landing_and_fails_promptly(self):
         route = MissionRoute((
             MissionWaypoint(1, 16, 60.0, 24.0, 10),
             MissionWaypoint(2, 21, 60.001, 24.0, 0),
@@ -154,8 +192,42 @@ class MissionOutcomeTests(unittest.TestCase):
         ), now=3)
         monitor.consume(message("HEARTBEAT", base_mode=0), now=4)
 
-        self.assertIsNone(monitor.evidence()["landing_confirmation"])
-        self.assertIsNone(monitor.evaluate(now=4))
+        outcome = monitor.evaluate(now=4)
+        self.assertEqual(
+            (outcome.category, outcome.reason, outcome.termination_reason),
+            ("failure", "landing_outside_endpoint_radius", "landing_outside_endpoint_radius"),
+        )
+        self.assertEqual(
+            monitor.evidence()["landing_confirmation"]["source"],
+            "disarmed_low_altitude_after_final_item",
+        )
+
+    def test_off_endpoint_disarm_after_deviation_preserves_deviation_failure(self):
+        route = MissionRoute((
+            MissionWaypoint(1, 16, 60.0, 24.0, 10),
+            MissionWaypoint(2, 21, 60.001, 24.0, 0),
+        ))
+        monitor = MissionOutcomeMonitor(route, started_at=0)
+        monitor.consume(message("MISSION_CURRENT", seq=1), now=1)
+        monitor.consume(message(
+            "SIMSTATE", lat=round(60.0005 * 1e7), lng=round(24.0 * 1e7),
+        ), now=2)
+        self.assertIsNotNone(monitor.first_deviation)
+
+        monitor.consume(message("MISSION_CURRENT", seq=2), now=3)
+        monitor.consume(message("HEARTBEAT", base_mode=128), now=4)
+        monitor.consume(message(
+            "GLOBAL_POSITION_INT",
+            lat=round(60.0005 * 1e7), lon=round(24.0 * 1e7), relative_alt=0,
+        ), now=5)
+        monitor.consume(message("HEARTBEAT", base_mode=0), now=6)
+
+        outcome = monitor.evaluate(now=6)
+        self.assertEqual(
+            (outcome.category, outcome.reason, outcome.termination_reason),
+            ("failure", "route_deviation", "landing_outside_endpoint_radius"),
+        )
+        self.assertIsNotNone(monitor.evidence()["landing_confirmation"])
 
     def test_simulator_truth_controls_route_and_endpoint_outcome(self):
         route = MissionRoute((

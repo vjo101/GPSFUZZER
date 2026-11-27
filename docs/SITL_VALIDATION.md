@@ -67,6 +67,17 @@ heartbeat landing fallback. Tune these named defaults in
 against representative missions; the applied values are copied into each
 `experiment.json` record so runs remain interpretable.
 
+When the terminal mission item is a LAND command, GPSFuzzer now sends an
+explicit disabled GPS-hook command as soon as mission progress reports that
+item active. The runner records its trigger time, command sequence, hook state,
+acknowledgment time, and simulation timestamp under
+`mission.landing_drift_disable`. It continues capturing telemetry and
+evaluating the mission outcome through landing. If the disable is not
+acknowledged, the run is marked incomplete and active drift is not sent again.
+Disabling spoofing restores native GPS measurements; it does not freeze the
+vehicle's physical `SIMSTATE` position, which continues to be recorded for
+route and endpoint evaluation.
+
 Focused tests cover success evidence, endpoint miss, both timeout paths,
 deviation, crash/EKF reports and their precedence, absent mission telemetry,
 mission duration expiry, and retained JSONL telemetry. A new baseline outcome
@@ -88,9 +99,10 @@ the endpoint and disarmed, but did not emit `MISSION_ITEM_REACHED` for its
 terminal LAND item or any `EXTENDED_SYS_STATE`; the monitor therefore waited
 90 seconds and reported `waypoint_progress_timeout`. The monitor now accepts a
 disarmed heartbeat as landing evidence after observing the vehicle armed, when
-the final item is active and GPS reports altitude at most 1 metre within 15
-metres of the endpoint. It prefers `EXTENDED_SYS_STATE` when available and
-records the fallback source. The follow-up run
+the final item is active, relative altitude is at most 1 metre, and vehicle
+position is available. Endpoint distance determines success or failure rather
+than whether touchdown is recognized. It prefers `EXTENDED_SYS_STATE` when
+available and records the fallback source. The follow-up run
 `20261125T051500.327771Z` completed as `landed_at_final_waypoint`: all three
 mission items uploaded, 8,933 telemetry messages retained, the final
 coordinate was 0.33 metres away, relative altitude was 0.078 metres, and the
@@ -134,9 +146,34 @@ deviation scenarios are validated. Crash and EKF-failsafe message
 classification remains covered by unit tests; no separate SITL injection was
 used for those signals.
 
+The landing-phase disable was exercised in SITL campaign
+`20261127T031858.168504Z` with static `waypoints.txt`. At terminal LAND
+activation, command sequence 3 was acknowledged at simulation time 111.989 s.
+The runner continued through touchdown and retained 21,909 telemetry
+messages; after the acknowledgment, 360 `GPS_RAW_INT` and 360 `SIMSTATE`
+samples were captured. Matching GPS and simulator coordinates by nearest host
+timestamp gave a mean offset of 0.011 metres and a maximum of 0.400 metres,
+consistent with the hook returning native GPS measurements after disable.
+ArduCopter disarmed at 0.003 metres relative altitude, but 84.17 metres from
+the mission endpoint, so this run correctly ended as a route-deviation failure
+with `landing_timeout` as the observation termination reason. The record is
+under `/tmp/gpsfuzzer-stop-landing-validation-escalated/20261127T031858.168504Z/`.
+
 An earlier upload attempt returned `MAV_MISSION_NO_SPACE` because it raced
 ArduCopter startup and checked mission capacity before the mission library
 initialized. Waiting for EKF/GPS readiness and following the reference
 takeoff-before-upload sequence resolved the issue. The mission SITL run above
 validates upload, AUTO execution, takeoff-gated activation, delayed drift, and
 log/provenance retention end to end.
+
+After broadening disarmed low-altitude landing confirmation to work regardless
+of endpoint distance, the same generated route was rerun as campaign
+`20261127T034117.818777Z`. Command sequence 3 disabled drift at terminal LAND
+activation and was acknowledged at simulation time 175.189 s. The vehicle
+disarmed at 0.017 metres relative altitude, 183.80 metres from the endpoint.
+GPSFuzzer ended immediately with `landing_outside_endpoint_radius` as the
+termination reason while retaining `route_deviation` as the failure
+classification. The run took 209.678 seconds versus 266.374 seconds for the
+prior run of the same seeded route, eliminating the 90-second landing-timeout
+wait; 22,957 telemetry messages were retained. Its record is under
+`/tmp/gpsfuzzer-endpoint-independent-landing-validation/20261127T034117.818777Z/`.
