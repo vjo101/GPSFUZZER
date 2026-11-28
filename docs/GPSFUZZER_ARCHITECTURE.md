@@ -91,6 +91,86 @@ by position source, terminal reason, and crash/EKF status messages. It records
 the 1 metre altitude limit used for the disarmed-heartbeat fallback. Raw
 MAVLink messages continue to be saved in `telemetry.jsonl`.
 
+## Resilience metrics and feedback-guided search
+
+Mission outcome evidence includes a `route_deviation_score` calculated only
+from timestamped `SIMSTATE` truth samples. The monitor pairs each sample with
+the latest `SYSTEM_TIME.time_boot_ms`, measures horizontal distance to the
+active route leg, and uses trapezoidal integration between consecutive samples
+on the same leg. It records whole-run and per-leg IAE in metre-seconds,
+duration-normalized IAE in metres, scored duration, sample/interval counts,
+and maximum truth-to-route deviation. It does not integrate across a mission
+leg change. If there are not enough timestamped truth samples to form an
+interval, the primary route score is marked unavailable; the existing
+`GLOBAL_POSITION_INT` fallback remains available for outcome checks but is
+not substituted into the resilience score.
+
+`gps_measurement_exposure` keeps spoof effect separate from physical route
+response. Its position fields compare valid `GPS_RAW_INT` coordinates with
+`SIMSTATE`; its velocity fields compare `GPS_RAW_INT` speed/course with
+finite-difference horizontal motion from `SIMSTATE`. `GLOBAL_POSITION_INT`
+velocity is retained separately as a vehicle-motion diagnostic. None of these
+exposure or diagnostic values contributes to route IAE.
+
+Feedback-guided runs compare outcomes lexicographically: route deviation,
+crash, timeout, EKF failure, then success. A route-deviation finding remains
+the top class even if a later terminal event occurs. Within that class, larger
+maximum route deviation wins first, followed by larger IAE. The implementation
+does not invert a mean error into a resilience score.
+
+In the adaptive campaign mode, each mission sweep holds one generated route
+fixed across eight coherent-drift bearing targets: 0, 45, 90, 135, 180, 225,
+270, and 315 degrees clockwise from north. Each target adjusts speed within
+`drift.horizontal_speed_mps`. The search starts at the range midpoint with a
+step of one quarter of its width; an improved best result preserves direction,
+while a tie or regression reverses direction and halves the step. A target
+stops after the configured attempt limit (10 by default) or when no new
+in-range speed is available. The next sweep generates a fresh seeded mission
+and resets target search state while retaining campaign-wide results.
+
+The adaptive settings reuse the normal drift speed range and add a target
+attempt limit:
+
+```json
+{
+  "drift": {
+    "horizontal_speed_mps": [0.5, 2.0],
+    "mode": "coherent"
+  },
+  "feedback": {
+    "max_attempts_per_bearing": 10
+  }
+}
+```
+
+The configured speed interval must have non-zero width and feedback-guided
+mode requires coherent drift. Every decision records the evaluated speed,
+prior best run and rank, direction and step before/after, next speed, and stop
+reason so the campaign can be audited and replayed.
+
+Run adaptive searches explicitly with `--feedback-guided` and a mission
+template. The positional iteration count is the number of full mission sweeps;
+`--until-stopped` repeats sweeps until Ctrl-C. Each campaign summary contains
+all run record paths, the active target state while a sweep is in progress, and
+`best_attack` with the run record, effective speed/bearing/delay, and mission
+artifact path plus SHA-256. On completion or interruption, the CLI prints the
+best run and its mission location. If no disruptive outcome was scored, it
+prints that no scored disruptive result exists.
+
+Replay the `record` path from `best_attack` directly, for example:
+
+```sh
+./.venv/bin/python -m gpsfuzzer --ardupilot ../ardupilot --results results/replays \
+  --replay-record results/<campaign-id>/runs/<run-id>/experiment.json
+```
+
+Replay validates the recorded effective coherent-drift values and verifies
+the saved mission artifact against its SHA-256 before starting SITL. The new
+experiment record links back to the source record and run. Replay preserves
+the attack inputs, route, seed, requested duration, speedup, frame, and
+location; it does not guarantee the same SITL outcome because scheduling and
+source revisions can change behavior.
+
 ## Seeded mission generation
 
 When a campaign is given a WPL mission, GPSFuzzer can use it as a home and

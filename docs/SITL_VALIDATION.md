@@ -177,3 +177,36 @@ classification. The run took 209.678 seconds versus 266.374 seconds for the
 prior run of the same seeded route, eliminating the 90-second landing-timeout
 wait; 22,957 telemetry messages were retained. Its record is under
 `/tmp/gpsfuzzer-endpoint-independent-landing-validation/20261127T034117.818777Z/`.
+
+## Feedback-guided campaign and attack replay
+
+The bounded validation configuration is `configs/sitl-feedback-validation.json`:
+seed `20261127`, one generated waypoint per route, one attempt per bearing,
+120 seconds requested duration, and 3x SITL speedup. The run used
+`waypoints.txt` as the mission template:
+
+```sh
+MAVPROXY_CMD="$PWD/.venv/bin/mavproxy.py" ./.venv/bin/python -m gpsfuzzer \
+  configs/sitl-feedback-validation.json --ardupilot ../ardupilot \
+  --results /tmp/gpsfuzzer-feedback-validation --mission waypoints.txt \
+  --feedback-guided --iterations 1
+```
+
+Campaign `20261128T020242.381827Z` completed all eight bearings. All eight
+runs produced an available SIMSTATE and SYSTEM_TIME route score and ranked as
+route deviations. The largest maximum deviation was 27.852 metres at bearing
+90 degrees, speed 1.25 m/s, with 749.053 metre-seconds of route IAE. The best
+run record is
+`/tmp/gpsfuzzer-feedback-validation/20261128T020242.381827Z/runs/20261128T020352.786333Z/experiment.json`.
+Its saved mission has SHA-256
+`61373e6d138a03ca01a26b4de3a9d42ef2926f51c71be02452713307f8c6c7cb`.
+
+That record was replayed with `--replay-record` into
+`/tmp/gpsfuzzer-feedback-replay/20261128T020739.801127Z/experiment.json`.
+Replay retained the same coherent drift (0 second delay, 1.25 m/s, bearing
+90 degrees), mission digest, 3x speedup, and frame. Both records report
+`landing_outside_endpoint_radius` and route deviation, and both report
+`cleanup.complete: true` with no cleanup errors. The original maximum
+deviation was 27.852 metres; replay measured 27.834 metres. This small
+difference demonstrates that replay preserves inputs and mission bytes while
+SITL outcome measurements can still vary slightly between runs.

@@ -6,7 +6,8 @@ import time
 from pathlib import Path
 
 from gpsfuzzer import (
-    DriftConfig, DriftMode, ExperimentConfig, MissionMutationConfig, NumericRange, sample_drift,
+    DriftConfig, DriftMode, ExperimentConfig, FeedbackSearchConfig,
+    MissionMutationConfig, NumericRange, sample_drift, validate_feedback_search,
 )
 from gpsfuzzer.ipc import (
     COMMAND_FORMAT,
@@ -108,6 +109,44 @@ class DriftConfigurationTests(unittest.TestCase):
             path.write_text(json.dumps({"seed": 42, "simulation_speedup": 2.0}), encoding="utf-8")
             config = _configuration(path)
         self.assertEqual(config.simulation_speedup, 2.0)
+
+    def test_feedback_search_settings_default_and_validate(self):
+        config = ExperimentConfig(seed=1)
+        self.assertEqual(config.feedback.max_attempts_per_bearing, 10)
+        validate_feedback_search(config)
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            FeedbackSearchConfig(max_attempts_per_bearing=0)
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            FeedbackSearchConfig(max_attempts_per_bearing=True)
+
+    def test_feedback_search_requires_coherent_non_degenerate_speed_range(self):
+        fixed_speed = ExperimentConfig(seed=1, drift=DriftConfig(
+            horizontal_speed_mps=NumericRange(1.0, 1.0),
+        ))
+        with self.assertRaisesRegex(ValueError, "non-degenerate speed range"):
+            validate_feedback_search(fixed_speed)
+
+        position_only = ExperimentConfig(seed=1, drift=DriftConfig(
+            horizontal_speed_mps=NumericRange(0.5, 2.0),
+            mode=DriftMode.POSITION_ONLY,
+        ))
+        with self.assertRaisesRegex(ValueError, "coherent drift"):
+            validate_feedback_search(position_only)
+
+    def test_experiment_json_parses_feedback_attempt_limit_and_speed_bounds(self):
+        from gpsfuzzer.__main__ import _configuration
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({
+                "seed": 42,
+                "drift": {"horizontal_speed_mps": [0.75, 3.5]},
+                "feedback": {"max_attempts_per_bearing": 6},
+            }), encoding="utf-8")
+            config = _configuration(path)
+        self.assertEqual(config.drift.horizontal_speed_mps, NumericRange(0.75, 3.5))
+        self.assertEqual(config.feedback.max_attempts_per_bearing, 6)
+        validate_feedback_search(config)
 
 
 class SharedMemoryTests(unittest.TestCase):

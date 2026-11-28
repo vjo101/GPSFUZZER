@@ -63,6 +63,125 @@ class MissionOutcomeTests(unittest.TestCase):
         self.assertEqual(DEFAULT_DEVIATION_LIMIT_M, 15.0)
         self.assertEqual(DEFAULT_PROGRESS_TIMEOUT_S, 90.0)
 
+    def test_route_deviation_iae_uses_simulation_time_and_truth_position(self):
+        route = MissionRoute((
+            MissionWaypoint(1, 16, 60.0, 24.0, 10),
+            MissionWaypoint(2, 21, 60.0, 24.001, 0),
+        ))
+        monitor = MissionOutcomeMonitor(route, started_at=0)
+        monitor.consume(message("MISSION_CURRENT", seq=2), now=0)
+        truth = {"lat": round(60.0001 * 1e7), "lng": round(24.0005 * 1e7)}
+        monitor.consume(message("SYSTEM_TIME", time_boot_ms=1000), now=100)
+        monitor.consume(message("SIMSTATE", **truth), now=100)
+        monitor.consume(message("SYSTEM_TIME", time_boot_ms=3000), now=102)
+        monitor.consume(message("SIMSTATE", **truth), now=102)
+
+        score = monitor.evidence()["route_deviation_score"]
+        expected_deviation = horizontal_distance_to_leg_m(
+            60.0001, 24.0005, *route.active_leg(2),
+        )
+        self.assertTrue(score["available"])
+        self.assertAlmostEqual(score["iae_m_s"], expected_deviation * 2, delta=0.1)
+        self.assertAlmostEqual(score["duration_normalized_iae_m"], expected_deviation, delta=0.1)
+        self.assertEqual(score["scored_duration_s"], 2.0)
+        self.assertEqual(score["sample_count"], 2)
+        self.assertEqual(score["interval_count"], 1)
+        self.assertAlmostEqual(score["maximum_deviation_m"], expected_deviation, delta=0.1)
+        self.assertEqual(score["by_leg"][0]["end_sequence"], 2)
+
+    def test_route_deviation_score_does_not_integrate_across_leg_change(self):
+        route = MissionRoute((
+            MissionWaypoint(1, 16, 60.0, 24.0, 10),
+            MissionWaypoint(2, 16, 60.0, 24.001, 10),
+            MissionWaypoint(3, 21, 60.001, 24.001, 0),
+        ))
+        monitor = MissionOutcomeMonitor(route, started_at=0)
+
+        def sample(sim_ms, lat, lon):
+            monitor.consume(message("SYSTEM_TIME", time_boot_ms=sim_ms), now=sim_ms / 1000)
+            monitor.consume(message(
+                "SIMSTATE", lat=round(lat * 1e7), lng=round(lon * 1e7),
+            ), now=sim_ms / 1000)
+
+        monitor.consume(message("MISSION_CURRENT", seq=2), now=0)
+        sample(1000, 60.0001, 24.0005)
+        sample(3000, 60.0001, 24.0005)
+        monitor.consume(message("MISSION_CURRENT", seq=3), now=4)
+        sample(5000, 60.0005, 24.0011)
+        sample(7000, 60.0005, 24.0011)
+
+        score = monitor.evidence()["route_deviation_score"]
+        self.assertEqual(score["interval_count"], 2)
+        self.assertEqual(score["scored_duration_s"], 4.0)
+        self.assertEqual(len(score["by_leg"]), 2)
+        self.assertEqual([leg["interval_count"] for leg in score["by_leg"]], [1, 1])
+        self.assertAlmostEqual(
+            score["iae_m_s"],
+            sum(leg["iae_m_s"] for leg in score["by_leg"]),
+        )
+
+    def test_route_deviation_score_is_unavailable_without_timestamped_truth(self):
+        route = MissionRoute((
+            MissionWaypoint(1, 16, 60.0, 24.0, 10),
+            MissionWaypoint(2, 21, 60.0, 24.001, 0),
+        ))
+        monitor = MissionOutcomeMonitor(route, started_at=0)
+        monitor.consume(message("MISSION_CURRENT", seq=2), now=1)
+        monitor.consume(message(
+            "GLOBAL_POSITION_INT",
+            lat=round(60.0001 * 1e7), lon=round(24.0005 * 1e7), relative_alt=10,
+        ), now=2)
+        score = monitor.evidence()["route_deviation_score"]
+        self.assertFalse(score["available"])
+        self.assertIsNone(score["iae_m_s"])
+        self.assertIsNone(score["maximum_deviation_m"])
+
+    def test_gps_exposure_and_velocity_diagnostics_are_separate_from_route_score(self):
+        route = MissionRoute((
+            MissionWaypoint(1, 16, 60.0, 24.0, 10),
+            MissionWaypoint(2, 21, 60.0, 24.01, 0),
+        ))
+        monitor = MissionOutcomeMonitor(route, started_at=0)
+        monitor.consume(message("MISSION_CURRENT", seq=2), now=0)
+        monitor.consume(message("SYSTEM_TIME", time_boot_ms=1000), now=1)
+        monitor.consume(message(
+            "SIMSTATE", lat=round(60.0 * 1e7), lng=round(24.001 * 1e7),
+        ), now=1)
+        monitor.consume(message("SYSTEM_TIME", time_boot_ms=2000), now=2)
+        monitor.consume(message(
+            "SIMSTATE", lat=round(60.0 * 1e7), lng=round(24.0011 * 1e7),
+        ), now=2)
+        monitor.consume(message(
+            "GLOBAL_POSITION_INT",
+            lat=round(60.002 * 1e7), lon=round(24.0011 * 1e7), relative_alt=20,
+            vx=123, vy=-45, vz=10,
+        ), now=2)
+        monitor.consume(message(
+            "GPS_RAW_INT",
+            fix_type=3,
+            lat=round(60.0002 * 1e7), lon=round(24.0011 * 1e7),
+            vel=200, cog=9000,
+        ), now=2)
+
+        evidence = monitor.evidence()
+        route_score = evidence["route_deviation_score"]
+        exposure = evidence["gps_measurement_exposure"]
+        self.assertAlmostEqual(route_score["maximum_deviation_m"], 0.0, delta=0.1)
+        self.assertAlmostEqual(route_score["iae_m_s"], 0.0, delta=0.1)
+        self.assertEqual(exposure["position"]["source"], "GPS_RAW_INT.lat_lon_vs_SIMSTATE")
+        self.assertGreater(exposure["position"]["maximum_offset_m"], 20.0)
+        self.assertEqual(
+            exposure["velocity"]["source"],
+            "GPS_RAW_INT.vel_cog_vs_finite_difference_SIMSTATE",
+        )
+        self.assertGreater(exposure["velocity"]["latest_error_mps"], 1.0)
+        self.assertEqual(evidence["vehicle_velocity_diagnostic"], {
+            "source": "GLOBAL_POSITION_INT.vx_vy_vz",
+            "north_mps": 1.23,
+            "east_mps": -0.45,
+            "down_mps": 0.1,
+        })
+
     def test_terminal_land_activation_is_one_shot_and_requires_land_command(self):
         land_route = MissionRoute((
             MissionWaypoint(1, 16, 60.0, 24.0, 10),

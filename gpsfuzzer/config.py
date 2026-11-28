@@ -61,6 +61,21 @@ class MissionMutationConfig:
 
 
 @dataclass(frozen=True)
+class FeedbackSearchConfig:
+    """Run limits for resilience-guided speed search."""
+
+    max_attempts_per_bearing: int = 10
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_attempts_per_bearing, bool)
+            or not isinstance(self.max_attempts_per_bearing, int)
+            or self.max_attempts_per_bearing <= 0
+        ):
+            raise ValueError("max_attempts_per_bearing must be a positive integer")
+
+
+@dataclass(frozen=True)
 class DriftConfig:
     """Drift bounds: delay in seconds, speed in m/s, bearing in degrees."""
 
@@ -89,6 +104,7 @@ class ExperimentConfig:
     duration_s: float = 300.0
     mission_mutation: MissionMutationConfig = MissionMutationConfig()
     simulation_speedup: float = 2.0
+    feedback: FeedbackSearchConfig = FeedbackSearchConfig()
 
     def __post_init__(self) -> None:
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
@@ -106,3 +122,14 @@ class ExperimentConfig:
             raise ValueError("simulation_speedup must be a whole number supported by sim_vehicle.py")
         if not isinstance(self.mission_mutation, MissionMutationConfig):
             raise ValueError("mission_mutation must be MissionMutationConfig")
+        if not isinstance(self.feedback, FeedbackSearchConfig):
+            raise ValueError("feedback must be FeedbackSearchConfig")
+
+
+def validate_feedback_search(config: ExperimentConfig) -> None:
+    """Validate settings that are required only by adaptive campaigns."""
+    if config.drift.mode is not DriftMode.COHERENT:
+        raise ValueError("feedback-guided search currently requires coherent drift mode")
+    speed = config.drift.horizontal_speed_mps
+    if speed.maximum <= speed.minimum:
+        raise ValueError("feedback-guided search requires a non-degenerate speed range")

@@ -100,6 +100,26 @@ class MissionOutcomeMonitor:
         self.maximum_deviation_m = 0.0
         self.maximum_reported_deviation_m = 0.0
         self.maximum_simulator_deviation_m = 0.0
+        self.maximum_truth_route_deviation_m = 0.0
+        self._simulation_time_ms: int | None = None
+        self._previous_route_score_sample: tuple[int, int, float] | None = None
+        self._route_iae_m_s = 0.0
+        self._route_scored_duration_s = 0.0
+        self._route_score_intervals = 0
+        self._route_score_samples = 0
+        self._route_score_legs: dict[str, dict] = {}
+        self._previous_truth_motion_sample: tuple[int, float, float] | None = None
+        self.truth_velocity_mps: dict | None = None
+        self.raw_gps_position: dict | None = None
+        self.raw_gps_velocity_mps: dict | None = None
+        self.latest_gps_position_offset_m: float | None = None
+        self.maximum_gps_position_offset_m: float | None = None
+        self.gps_position_offset_sum_m = 0.0
+        self.gps_position_offset_samples = 0
+        self.latest_gps_velocity_error_mps: float | None = None
+        self.maximum_gps_velocity_error_mps: float | None = None
+        self.gps_velocity_error_samples = 0
+        self.vehicle_velocity_diagnostic_mps: dict | None = None
         self.first_deviation: dict | None = None
         self.safety_events: list[dict] = []
 
@@ -132,6 +152,14 @@ class MissionOutcomeMonitor:
                     "severity": getattr(message, "severity", None),
                     "observed_monotonic_ns": round(observed_at * 1_000_000_000),
                 })
+
+        if kind == "SYSTEM_TIME":
+            try:
+                simulation_time_ms = int(message.time_boot_ms)
+            except (AttributeError, TypeError, ValueError):
+                simulation_time_ms = None
+            if simulation_time_ms is not None and simulation_time_ms >= 0:
+                self._simulation_time_ms = simulation_time_ms
 
         if kind == "MISSION_CURRENT":
             self._record_progress(int(message.seq), observed_at)
@@ -172,8 +200,20 @@ class MissionOutcomeMonitor:
                 "longitude": longitude,
                 "relative_altitude_m": float(getattr(message, "relative_alt", 0)) / 1000.0,
             }
+            try:
+                self.vehicle_velocity_diagnostic_mps = {
+                    "source": "GLOBAL_POSITION_INT.vx_vy_vz",
+                    "north_mps": float(message.vx) / 100.0,
+                    "east_mps": float(message.vy) / 100.0,
+                    "down_mps": float(message.vz) / 100.0,
+                }
+            except (AttributeError, TypeError, ValueError):
+                self.vehicle_velocity_diagnostic_mps = None
             self._update_geometry(observed_at)
             self._confirm_disarmed_landing(observed_at)
+
+        if kind == "GPS_RAW_INT":
+            self._record_raw_gps_measurement(message)
 
         if kind == "SIMSTATE":
             self.simulator_truth_position = {
@@ -185,7 +225,170 @@ class MissionOutcomeMonitor:
                 ),
             }
             self._update_geometry(observed_at)
+            self._record_route_score_sample()
+            self._update_truth_velocity()
             self._confirm_disarmed_landing(observed_at)
+
+    def _record_raw_gps_measurement(self, message) -> None:
+        """Keep raw GPS attack exposure distinct from vehicle route response."""
+        try:
+            fix_type = int(message.fix_type)
+            latitude = float(message.lat) / 1.0e7
+            longitude = float(message.lon) / 1.0e7
+        except (AttributeError, TypeError, ValueError):
+            return
+        if (
+            fix_type < 2
+            or not math.isfinite(latitude)
+            or not math.isfinite(longitude)
+            or not -90 <= latitude <= 90
+            or not -180 <= longitude <= 180
+        ):
+            return
+        self.raw_gps_position = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "fix_type": fix_type,
+        }
+        if self.simulator_truth_position is not None:
+            offset = horizontal_distance_m(
+                latitude,
+                longitude,
+                self.simulator_truth_position["latitude"],
+                self.simulator_truth_position["longitude"],
+            )
+            self.latest_gps_position_offset_m = offset
+            self.maximum_gps_position_offset_m = max(
+                offset,
+                self.maximum_gps_position_offset_m
+                if self.maximum_gps_position_offset_m is not None else 0.0,
+            )
+            self.gps_position_offset_sum_m += offset
+            self.gps_position_offset_samples += 1
+
+        try:
+            speed_mps = float(message.vel) / 100.0
+            course_deg = float(message.cog) / 100.0
+        except (AttributeError, TypeError, ValueError):
+            return
+        if (
+            not math.isfinite(speed_mps)
+            or not math.isfinite(course_deg)
+            or speed_mps < 0
+            or course_deg < 0
+            or course_deg >= 360
+            or speed_mps >= 655.35
+        ):
+            return
+        course_rad = math.radians(course_deg)
+        self.raw_gps_velocity_mps = {
+            "source": "GPS_RAW_INT.vel_cog",
+            "north_mps": speed_mps * math.cos(course_rad),
+            "east_mps": speed_mps * math.sin(course_rad),
+            "speed_mps": speed_mps,
+            "course_deg": course_deg,
+        }
+        if self.truth_velocity_mps is not None:
+            north_error = (
+                self.raw_gps_velocity_mps["north_mps"]
+                - self.truth_velocity_mps["north_mps"]
+            )
+            east_error = (
+                self.raw_gps_velocity_mps["east_mps"]
+                - self.truth_velocity_mps["east_mps"]
+            )
+            error = math.hypot(north_error, east_error)
+            self.latest_gps_velocity_error_mps = error
+            self.maximum_gps_velocity_error_mps = max(
+                error,
+                self.maximum_gps_velocity_error_mps
+                if self.maximum_gps_velocity_error_mps is not None else 0.0,
+            )
+            self.gps_velocity_error_samples += 1
+
+    def _update_truth_velocity(self) -> None:
+        """Estimate horizontal truth velocity from timestamped SIMSTATE samples."""
+        if self._simulation_time_ms is None or self.simulator_truth_position is None:
+            self._previous_truth_motion_sample = None
+            return
+        current = (
+            self._simulation_time_ms,
+            self.simulator_truth_position["latitude"],
+            self.simulator_truth_position["longitude"],
+        )
+        previous = self._previous_truth_motion_sample
+        if previous is not None:
+            delta_s = (current[0] - previous[0]) / 1000.0
+            if delta_s > 0:
+                mean_latitude = math.radians((current[1] + previous[1]) / 2.0)
+                north_m = EARTH_RADIUS_M * math.radians(current[1] - previous[1])
+                east_m = (
+                    EARTH_RADIUS_M * math.cos(mean_latitude)
+                    * math.radians(current[2] - previous[2])
+                )
+                self.truth_velocity_mps = {
+                    "source": "finite_difference_SIMSTATE",
+                    "north_mps": north_m / delta_s,
+                    "east_mps": east_m / delta_s,
+                    "simulation_time_ms": current[0],
+                }
+        self._previous_truth_motion_sample = current
+
+    def _record_route_score_sample(self) -> None:
+        """Accumulate truth-to-route absolute error using SITL simulation time."""
+        if self._simulation_time_ms is None or self.simulator_truth_position is None:
+            self._previous_route_score_sample = None
+            return
+        sequence = (
+            self.current_sequence
+            if self.current_sequence is not None
+            else self.route.waypoints[0].sequence
+        )
+        leg = self.route.active_leg(sequence)
+        if leg is None:
+            self._previous_route_score_sample = None
+            return
+        start, end = leg
+        leg_key = f"{start.sequence}:{end.sequence}"
+        position = self.simulator_truth_position
+        deviation_m = horizontal_distance_to_leg_m(
+            position["latitude"], position["longitude"], start, end,
+        )
+        self._route_score_samples += 1
+        self.maximum_truth_route_deviation_m = max(
+            self.maximum_truth_route_deviation_m, deviation_m,
+        )
+        leg_score = self._route_score_legs.setdefault(leg_key, {
+            "start_sequence": start.sequence,
+            "end_sequence": end.sequence,
+            "iae_m_s": 0.0,
+            "scored_duration_s": 0.0,
+            "maximum_deviation_m": 0.0,
+            "sample_count": 0,
+            "interval_count": 0,
+        })
+        leg_score["maximum_deviation_m"] = max(
+            leg_score["maximum_deviation_m"], deviation_m,
+        )
+        leg_score["sample_count"] += 1
+
+        previous = self._previous_route_score_sample
+        current_time = self._simulation_time_ms
+        if previous is not None and previous[1] == end.sequence:
+            previous_time, _previous_sequence, previous_deviation = previous
+            delta_ms = current_time - previous_time
+            if delta_ms > 0:
+                delta_s = delta_ms / 1000.0
+                interval_iae = (previous_deviation + deviation_m) * 0.5 * delta_s
+                self._route_iae_m_s += interval_iae
+                self._route_scored_duration_s += delta_s
+                self._route_score_intervals += 1
+                leg_score["iae_m_s"] += interval_iae
+                leg_score["scored_duration_s"] += delta_s
+                leg_score["interval_count"] += 1
+        self._previous_route_score_sample = (
+            current_time, end.sequence, deviation_m,
+        )
 
     def _record_progress(self, sequence: int, observed_at: float, *, force: bool = False) -> None:
         # MAVLink can deliver an older MISSION_CURRENT after a newer sequence
@@ -386,6 +589,50 @@ class MissionOutcomeMonitor:
             "first_deviation": self.first_deviation,
             "maximum_reported_deviation_m": self.maximum_reported_deviation_m,
             "maximum_simulator_deviation_m": self.maximum_simulator_deviation_m,
+            "route_deviation_score": {
+                "source": "SIMSTATE",
+                "clock": "SYSTEM_TIME.time_boot_ms",
+                "method": "trapezoidal_integral_of_horizontal_distance_to_active_route_leg",
+                "iae_m_s": (
+                    self._route_iae_m_s if self._route_score_intervals else None
+                ),
+                "duration_normalized_iae_m": (
+                    self._route_iae_m_s / self._route_scored_duration_s
+                    if self._route_scored_duration_s > 0 else None
+                ),
+                "scored_duration_s": self._route_scored_duration_s,
+                "sample_count": self._route_score_samples,
+                "interval_count": self._route_score_intervals,
+                "maximum_deviation_m": (
+                    self.maximum_truth_route_deviation_m
+                    if self._route_score_samples else None
+                ),
+                "available": self._route_score_intervals > 0,
+                "by_leg": list(self._route_score_legs.values()),
+            },
+            "gps_measurement_exposure": {
+                "position": {
+                    "source": "GPS_RAW_INT.lat_lon_vs_SIMSTATE",
+                    "latest_offset_m": self.latest_gps_position_offset_m,
+                    "maximum_offset_m": self.maximum_gps_position_offset_m,
+                    "mean_offset_m": (
+                        self.gps_position_offset_sum_m / self.gps_position_offset_samples
+                        if self.gps_position_offset_samples else None
+                    ),
+                    "sample_count": self.gps_position_offset_samples,
+                    "latest_raw_gps_position": self.raw_gps_position,
+                    "latest_simulator_truth_position": self.simulator_truth_position,
+                },
+                "velocity": {
+                    "source": "GPS_RAW_INT.vel_cog_vs_finite_difference_SIMSTATE",
+                    "latest_error_mps": self.latest_gps_velocity_error_mps,
+                    "maximum_error_mps": self.maximum_gps_velocity_error_mps,
+                    "sample_count": self.gps_velocity_error_samples,
+                    "latest_raw_gps_velocity": self.raw_gps_velocity_mps,
+                    "latest_truth_velocity": self.truth_velocity_mps,
+                },
+            },
+            "vehicle_velocity_diagnostic": self.vehicle_velocity_diagnostic_mps,
             "thresholds": {
                 "deviation_limit_m": self.deviation_limit_m,
                 "landing_radius_m": self.deviation_limit_m,
