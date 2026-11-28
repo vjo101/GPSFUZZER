@@ -1,10 +1,17 @@
 {
   "seed": 20261124,
   "duration_s": 300,
+  "simulation_speedup": 2,
   "drift": {
-    "start_delay_s": [3, 8],
-    "horizontal_speed_mps": [0.5, 2.0],
+    "start_delay_s": [0, 8],
+    "horizontal_speed_mps": [0.5, 5.0],
     "bearing_deg": [0, 360],
     "mode": "coherent"
+  },
+  "mission_mutation": {
+    "waypoint_count": [3, 6],
+    "leg_distance_m": [60, 150],
+    "bearing_deg": [0, 360],
+    "altitude_m": [10, 10]
   }
 }
